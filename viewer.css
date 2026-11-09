@@ -1,0 +1,282 @@
+/* ローカルPDFエディター — 画面のスタイル。文字選択用のテキストレイヤーは lib/textlayer.css。
+   上から: 全体・ツールバー → ページ表示 → 左のツール欄 → 右のパネル → ダイアログ → ページの整理 → 文書のプロパティ → 印刷 */
+:root{ --bar:#f3f3f3; --bd:#d0d0d0; --acc:#0f6cbd; --fg:#1b1b1b; }
+*{box-sizing:border-box}
+html,body{height:100%;margin:0;font:13px/1.4 "Yu Gothic UI","Meiryo UI","Segoe UI",sans-serif;color:var(--fg)}
+body{display:flex;flex-direction:column;background:#525659}
+[hidden]{display:none!important}
+.grow{flex:1}
+button,select,input[type=number]{font:inherit}
+/* 先読み描画の組み立て場所（画面外） */
+#stage{position:absolute;left:-200000px;top:0;visibility:hidden;pointer-events:none}
+.stagepg{position:relative;--user-unit:1;--total-scale-factor:calc(var(--scale-factor)*var(--user-unit));--scale-round-x:1px;--scale-round-y:1px}
+#toolbar{display:flex;align-items:center;flex-wrap:nowrap;gap:8px;padding:5px 8px;background:var(--bar);border-bottom:1px solid var(--bd);overflow-x:auto;overflow-y:hidden;white-space:nowrap;flex:none}
+#toolbar .grp{display:flex;align-items:center;flex:none;gap:4px;padding-right:8px;border-right:1px solid var(--bd)}
+#toolbar button,#toolbar select,.link{flex:none;height:30px;padding:0 10px;border:1px solid var(--bd);border-radius:4px;background:#fff;color:var(--fg);cursor:pointer}
+#toolbar button:hover{background:#e8f1fb}
+#toolbar button:disabled{opacity:.4;cursor:default}
+#btnFitH{display:inline-flex;align-items:center;gap:4px}
+.ico{width:16px;height:16px;vertical-align:-3px}
+#selZoom{max-width:230px}
+#pageNum{width:56px;height:28px;text-align:right}
+.fname{flex:1 1 0;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:#555;text-align:right;padding:0 6px}
+@media (max-width:1300px){ #toolbar .lbl{display:none} #selZoom{max-width:150px} }
+@media (max-width:1100px){ .fname{display:none} #toolbar{gap:5px} #toolbar button,#toolbar select{padding:0 7px} }
+#warn{flex:none;background:#fff4ce;color:#5a4500;border-bottom:1px solid #e6cf80;padding:6px 36px 6px 12px;font-size:12px;position:relative;line-height:1.5}
+#warn small{color:#6b5a1a}
+#warn button{position:absolute;right:8px;top:6px;border:none;background:transparent;font-size:16px;cursor:pointer;color:#5a4500}
+main{flex:1;display:flex;min-height:0}
+#tools{flex:none;width:136px;background:var(--bar);border-right:1px solid var(--bd);display:flex;flex-direction:column;overflow-y:auto;overflow-x:hidden}
+#tools.collapsed{width:26px}
+.tools-head{display:flex;align-items:center;justify-content:space-between;padding:4px 4px 4px 10px;border-bottom:1px solid var(--bd);flex:none}
+.tools-title{font-size:12px;color:#555}
+#btnTools{width:26px;height:26px;padding:0;border:1px solid var(--bd);border-radius:4px;background:#fff;cursor:pointer;font-size:11px;color:#444;flex:none}
+#btnTools:hover{background:#e8f1fb}
+#tools.collapsed .tools-head{padding:4px 0;justify-content:center;border-bottom:none}
+#tools.collapsed .tools-title,#tools.collapsed .tl{display:none}
+.tl{display:flex;flex-direction:column;gap:4px;padding:8px 8px 12px}
+.tl button{display:flex;align-items:center;gap:7px;width:100%;height:34px;padding:0 8px;border:1px solid var(--bd);border-radius:4px;background:#fff;color:var(--fg);cursor:pointer;text-align:left;white-space:nowrap}
+.tl button:hover{background:#e8f1fb}
+.tl button:disabled{opacity:.4;cursor:default}
+.tl svg{width:16px;height:16px;flex:none}
+.tl button.tool.active{background:var(--acc);color:#fff;border-color:var(--acc)}
+.tl .split{display:flex}
+.tl .split #btnDateStamp{flex:1;border-top-right-radius:0;border-bottom-right-radius:0}
+.tl .split #btnDateStampCfg{flex:none;width:30px;padding:0;justify-content:center;border-left:none;border-top-left-radius:0;border-bottom-left-radius:0}
+.tl .pin{display:flex;align-items:center;gap:5px;font-size:12px;color:#444;padding:6px 2px 0}
+.tl .tsep{width:100%;border:0;border-top:1px solid var(--bd);margin:8px 0 4px}
+#wrapbox{flex:1;position:relative;min-width:0;display:flex}
+#wrap{flex:1;overflow:auto;position:relative;min-width:0}
+/* ページ数スクロールバー（縦に収める／ページ全体のとき） */
+#pgbar{position:absolute;right:0;top:0;bottom:0;width:16px;background:#3d4043;border-left:1px solid #2c2e30;z-index:6;user-select:none;touch-action:none}
+#pgthumb{position:absolute;left:2px;right:2px;top:0;min-height:30px;border-radius:5px;background:#9da1a6;cursor:grab}
+#pgthumb:hover,#pgthumb.drag{background:#c3c7cc}
+#pgthumb.drag{cursor:grabbing}
+#pgtip{position:absolute;right:22px;top:0;background:#202225;color:#fff;font-size:12px;padding:3px 8px;border-radius:4px;white-space:nowrap;pointer-events:none;box-shadow:0 2px 8px rgba(0,0,0,.4)}
+#pages{padding:12px 0 40px}
+.pg{position:relative;margin:0 auto 10px;background:#fff;box-shadow:0 1px 4px rgba(0,0,0,.5);
+  --user-unit:1;--total-scale-factor:calc(var(--scale-factor)*var(--user-unit));--scale-round-x:1px;--scale-round-y:1px;overflow:hidden}
+body.paged #pages{padding:0}
+body.paged .pg{margin:0 auto}
+/* 1ページ表示: 表示していないページは、画面の外に置いたまま描画を済ませておく（先読み）。切り替え時に白い画面が出ない */
+.pg.off{position:absolute;left:-200000px;top:0;margin:0!important;visibility:hidden;pointer-events:none}
+.pg canvas{position:absolute;inset:0;display:block}
+body.gam .pg canvas{filter:url(#epaGamma)}
+.pg .textLayer{position:absolute;inset:0}
+.textLayer ::selection,.textLayer span::selection,.textLayer i::selection{background:rgba(0,100,162,.4);color:transparent}
+.pg svg.ov{position:absolute;inset:0;pointer-events:none;overflow:visible}
+body:not(.tool-select) .pg svg.ov{pointer-events:auto;cursor:crosshair}
+body:not(.tool-select) .pg .textLayer{pointer-events:none}
+svg.ov .hit{cursor:move}
+svg.ov .h{cursor:pointer}
+svg.ov .nh{cursor:nwse-resize}
+.msg{position:absolute;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;color:#eee;gap:6px;text-align:center}
+.msg button{height:34px;padding:0 16px;border-radius:4px;border:1px solid #fff;background:transparent;color:#fff;cursor:pointer}
+.msg.err{color:#ffd9d9}
+.msg .small{font-size:12px;opacity:.8;color:inherit}
+#props{flex:none;width:340px;background:#fff;border-left:1px solid var(--bd);padding:10px 14px;overflow:auto}
+#props.hidden{display:none}
+.target{font-size:12px;color:#fff;background:#6b6b6b;border-radius:3px;padding:2px 8px;display:inline-block;margin-bottom:10px}
+.target.sel{background:var(--acc)}
+#natBox{margin-bottom:10px}
+.pri-btn{height:30px;padding:0 12px;border:1px solid var(--acc);border-radius:4px;background:var(--acc);color:#fff;cursor:pointer}
+.grid{display:grid;grid-template-columns:1fr 1fr;gap:4px 12px;align-items:center}
+.grid label,.opac label,.viewset label{font-size:12px;color:#333}
+.grid select,.num input,.viewset select{width:100%;height:28px;border:1px solid #8a8a8a;border-radius:2px;padding:0 4px;background:#fff}
+.num{display:flex;align-items:center;gap:4px}
+.num input{min-width:0}
+.num span{font-size:12px;white-space:nowrap}
+.sw{display:flex;align-items:center;gap:6px;margin-bottom:6px}
+.sw input[type=color]{width:34px;height:28px;padding:1px;border:1px solid #8a8a8a;background:#fff}
+.sw input.none::-webkit-color-swatch{background:linear-gradient(to top right,#fff calc(50% - 1.5px),#d33 calc(50% - 1.5px),#d33 calc(50% + 1.5px),#fff calc(50% + 1.5px));border-color:#bbb}
+.sw button{height:26px;padding:0 8px;border:1px solid #aaa;background:#fafafa;border-radius:3px;cursor:pointer}
+.opac{margin-top:4px}
+.opac .num{width:130px;margin:3px 0}
+.opac input[type=range],.viewset input[type=range]{width:100%}
+.opac select{border:1px solid #8a8a8a;border-radius:2px;padding:0 4px;background:#fff}
+.viewset{display:flex;flex-direction:column;gap:4px}
+.mini{height:20px;padding:0 6px;font-size:11px;border:1px solid #bbb;border-radius:3px;background:#fafafa;cursor:pointer;margin-left:6px}
+.hint{font-size:11px;color:#a33;min-height:14px;margin:4px 0}
+hr{border:0;border-top:1px solid #e4e4e4;margin:10px 0}
+.small,.small li{font-size:11.5px;color:#555}
+ul.small{padding-left:16px;margin:4px 0}
+summary{cursor:pointer;font-size:12px}
+.chk{display:flex;gap:6px;align-items:center;font-size:12px}
+.link{margin-top:8px;height:28px!important}
+select:disabled,input:disabled{background:#eee!important;color:#999}
+#toast{position:fixed;left:50%;bottom:20px;transform:translateX(-50%);background:#222;color:#fff;padding:8px 16px;border-radius:6px;opacity:0;pointer-events:none;transition:opacity .25s;z-index:80;max-width:80vw;word-break:break-all}
+#toast.show{opacity:.95}
+@media (max-width:900px){#props{width:280px}}
+#toolbar .menu{position:relative}
+.menu-pop{display:none;position:fixed;z-index:60;min-width:210px;background:#fff;border:1px solid var(--bd);border-radius:6px;box-shadow:0 6px 20px rgba(0,0,0,.25);padding:4px;white-space:normal}
+.menu-pop.open{display:block}
+#toolbar .menu-pop button{display:block;width:100%;text-align:left;border:none;background:transparent;height:32px}
+#toolbar .menu-pop button:hover{background:#e8f1fb}
+.menu-note{font-size:11px;color:#777;padding:4px 10px}
+.tabs{display:flex;margin:-10px -14px 10px;border-bottom:1px solid var(--bd);background:#f7f7f7}
+.tabs button{flex:1;height:34px;border:none;background:transparent;cursor:pointer;border-bottom:2px solid transparent}
+.tabs button.on{border-bottom-color:var(--acc);font-weight:600;background:#fff}
+.badge{display:inline-block;min-width:18px;padding:0 5px;border-radius:9px;background:#888;color:#fff;font-size:11px;text-align:center}
+.lhead{display:flex;gap:6px;margin-bottom:6px}
+.lhead input{flex:1;min-width:0;height:28px;border:1px solid #aaa;border-radius:3px;padding:0 6px}
+.lhead select{height:28px;border:1px solid #aaa;border-radius:3px}
+.author{display:flex;align-items:center;gap:6px;font-size:12px;margin-bottom:6px}
+.author input{flex:1;height:26px;border:1px solid #aaa;border-radius:3px;padding:0 6px}
+#listScroll{max-height:calc(100vh - 210px);overflow:auto;border:1px solid #e1e1e1;border-radius:4px}
+#cmtList{list-style:none;margin:0;padding:0}
+.cmt{padding:6px 8px;border-bottom:1px solid #eee;cursor:pointer}
+.cmt:hover{background:#f2f7fd}
+.cmt.sel{background:#dcebfb;outline:1px solid var(--acc)}
+.cmt.reply{margin-left:16px;border-left:3px solid #ddd}
+.cmt .c1{display:flex;align-items:center;gap:6px;font-size:12px}
+.cmt .dot{width:10px;height:10px;border-radius:50%;flex:none}
+.cmt .lab{flex:none}
+.cmt .who{color:#555;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;min-width:0}
+.cmt .when{margin-left:auto;color:#888;font-size:11px;white-space:nowrap}
+.cmt .cdel{border:none;background:transparent;color:#a33;cursor:pointer;padding:0 4px;font-size:13px}
+.cmt .cdel:hover{background:#fde4e4;border-radius:3px}
+.cmt .c2{font-size:12.5px;margin-top:3px;white-space:pre-wrap;word-break:break-word;max-height:4.8em;overflow:hidden}
+.cmt .c2.empty{color:#aaa}
+#cmtEmpty{padding:12px;text-align:center}
+textarea.te{position:absolute;z-index:5;margin:0;border:1.5px dashed #0f6cbd;outline:none;resize:none;overflow:hidden;box-sizing:border-box;line-height:1.25;white-space:pre-wrap;overflow-wrap:anywhere}
+body.tool-text .pg svg.ov{cursor:text}
+.modal{position:fixed;inset:0;z-index:50;background:#3b3d40;display:flex;flex-direction:column}
+.modal.hidden{display:none}
+.org-bar{display:flex;align-items:center;gap:8px;padding:8px 12px;background:var(--bar);border-bottom:1px solid var(--bd);flex-wrap:wrap}
+.org-bar button{height:30px;padding:0 10px;border:1px solid var(--bd);border-radius:4px;background:#fff;cursor:pointer}
+.org-bar button:hover{background:#e8f1fb}
+.pri{background:var(--acc)!important;color:#fff!important;border-color:var(--acc)!important}
+.org-note{color:#ddd;font-size:12px;padding:6px 14px}
+#orgGrid{flex:1;overflow:auto;padding:10px 14px 40px;display:flex;flex-wrap:wrap;align-content:flex-start;gap:12px}
+.thumb{width:190px;padding:6px;border:2px solid transparent;border-radius:6px;cursor:grab;position:relative;color:#eee;text-align:center}
+.thumb .tbox{height:178px;display:flex;align-items:center;justify-content:center;background:#555;border-radius:3px}
+.thumb canvas{background:#fff;box-shadow:0 1px 4px rgba(0,0,0,.6)}
+.thumb .tlab{font-size:12px;margin-top:3px}
+.thumb .ext{color:#7fd6a0}.thumb .rot{color:#ffd37f}
+.thumb:hover{background:rgba(255,255,255,.08)}
+.thumb.sel{border-color:#4ea1ff;background:rgba(78,161,255,.22)}
+.thumb.ins-before::before,.thumb.ins-after::after{content:"";position:absolute;top:0;bottom:0;width:4px;background:#ffd400;border-radius:2px}
+.thumb.ins-before::before{left:-8px}.thumb.ins-after::after{right:-8px}
+dialog#dlg{border:none;border-radius:8px;padding:0;box-shadow:0 10px 40px rgba(0,0,0,.5);min-width:420px;max-width:92vw}
+dialog#dlg::backdrop{background:rgba(0,0,0,.45)}
+dialog#dlg form{padding:16px 20px}
+dialog#dlg h3{margin:0 0 10px;font-size:15px}
+.dbody label{display:block;margin:8px 0;font-size:13px}
+.dbody input[type=text],.dbody input:not([type]),.dbody input[type=number],.dbody select,.dbody textarea{height:28px;border:1px solid #8a8a8a;border-radius:3px;padding:0 6px;font:inherit}
+.dbody textarea{height:auto;padding:6px}
+.dbody input#iRange,.dbody input#rRange,.dbody input#xRange{width:200px}
+.dbody input.w{width:260px}
+.dsrow{display:flex;gap:16px;align-items:flex-start}
+#dsPrev{width:130px;height:130px;flex:none;border:1px solid #ddd;border-radius:6px;background:#fff}
+.derr{color:#c22;font-size:12px;min-height:16px;margin:6px 0 0}
+.dbtn{display:flex;justify-content:flex-end;gap:8px;margin-top:10px}
+.dbtn button{height:30px;padding:0 16px;border:1px solid var(--bd);border-radius:4px;background:#fff;cursor:pointer}
+#dropHint{display:none;position:fixed;inset:12px;z-index:60;border:3px dashed #4ea1ff;border-radius:12px;background:rgba(15,108,189,.25);color:#fff;font-size:18px;align-items:center;justify-content:center;pointer-events:none;text-align:center;padding:20px}
+#dropHint.on{display:flex}
+#busy{display:none;position:fixed;inset:0;z-index:70;background:rgba(0,0,0,.35);align-items:center;justify-content:center;gap:12px;color:#fff;font-size:15px;cursor:progress}
+#busy.on{display:flex;background:transparent}
+#busy.on > *{visibility:hidden}
+#busy.on.show{background:rgba(0,0,0,.35)}
+#busy.on.show > *{visibility:visible}
+.spin{width:22px;height:22px;border:3px solid #fff;border-right-color:transparent;border-radius:50%;animation:sp .8s linear infinite}
+@keyframes sp{to{transform:rotate(360deg)}}
+.nhit{fill:transparent;stroke:transparent;pointer-events:all;cursor:pointer}
+.nhit:hover{fill:rgba(15,108,189,.12);stroke:rgba(15,108,189,.35)}
+path.nhit{fill:none}
+body:not(.tool-select):not(.tool-asel) .nhit{pointer-events:none}
+/* 内容の編集（v3.0） */
+body.tool-edit .pg svg.ov{cursor:default}
+.ce-layer{position:absolute;inset:0;pointer-events:none;z-index:3}
+.ce-hole{position:absolute;background:#fff}
+.ce-mov{position:absolute;left:0;top:0;width:100%;height:100%;transform-origin:0 0}
+.pg .ce-mov canvas{position:absolute;right:auto;bottom:auto}
+.pg svg.ov{z-index:4}
+svg.ov .ceh{cursor:nwse-resize}
+textarea.ce-te{z-index:6;box-shadow:0 0 0 3px rgba(15,108,189,.18)}
+#ceBox{margin-bottom:10px;display:flex;flex-direction:column;gap:6px}
+#ceInfo{line-height:1.5;word-break:break-all}
+.cebtns{display:flex;gap:6px;flex-wrap:wrap}
+.cebtns button{height:30px;padding:0 12px;border:1px solid var(--bd);border-radius:4px;background:#fff;cursor:pointer}
+.cebtns button.pri-btn{border-color:var(--acc);background:var(--acc);color:#fff}
+.cebtns button:disabled{opacity:.45;cursor:default}
+body.tool-edit .ce-hide{display:none!important}
+/* v3.1 */
+body.tool-asel .pg svg.ov{cursor:default}
+svg.ov .roth{cursor:grab}
+#multiBox{margin-bottom:10px}
+#btnRotL,#btnRotR{display:inline-flex;align-items:center;padding:0 7px}
+/* v3.2: 描画ツール中にCtrl: 注釈の上でも描画カーソル */
+html.ctrl-draw body:not(.tool-select):not(.tool-asel):not(.tool-edit) .pg svg.ov .hit{cursor:crosshair}
+/* v3.3: カラーパレット */
+.pal{display:grid;grid-template-columns:repeat(6,18px);gap:3px;margin:-2px 0 8px}
+.pal button{width:18px;height:18px;padding:0;border:1px solid #9a9a9a;border-radius:3px;cursor:pointer}
+.pal button:hover{outline:2px solid var(--acc);outline-offset:1px}
+.grid:has(#pColor:disabled) .pal-c,.grid:has(#pFill:disabled) .pal-f{opacity:.35;pointer-events:none}
+svg.ov .gh{cursor:nwse-resize}
+/* v3.6: 配置順 */
+#zBox{margin-bottom:10px}
+#zBox .zlab{font-size:12px;color:#333;margin-bottom:3px}
+#zBox .zbtns{display:grid;grid-template-columns:repeat(4,1fr);gap:4px}
+#zBox button{height:28px;padding:0 4px;border:1px solid var(--bd);border-radius:4px;background:#fff;cursor:pointer;font-size:12px;white-space:nowrap}
+#zBox button:hover{background:#e8f1fb}
+/* v4.0: 文書のプロパティ */
+.docprops{width:560px;max-width:84vw;max-height:70vh;overflow:auto;padding-right:4px}
+.docprops h4{margin:12px 0 6px;font-size:13px;color:#333;border-bottom:1px solid #e4e4e4;padding-bottom:3px}
+.docprops h4:first-child{margin-top:0}
+.docprops .dp-l{display:grid!important;grid-template-columns:150px 1fr;align-items:center;gap:8px;margin:5px 0!important}
+.docprops .dp-l input{width:100%;height:28px}
+.dp-t{border-collapse:collapse;width:100%;font-size:12.5px}
+.dp-t th{text-align:left;font-weight:normal;color:#555;width:170px;padding:3px 8px 3px 0;vertical-align:top}
+.dp-t td{padding:3px 0;word-break:break-all}
+.docprops .ok{color:#18794e}.docprops .ng{color:#c22}
+.dp-unlock{margin-top:8px;padding:10px;border:1px solid #f0d58a;background:#fffbea;border-radius:6px}
+.dp-unlock .dp-row{display:flex;gap:8px}
+.dp-unlock input{flex:1;height:30px;border:1px solid #8a8a8a;border-radius:3px;padding:0 8px}
+.dp-unlock button{height:30px;padding:0 14px;border-radius:4px;border:1px solid var(--acc);cursor:pointer}
+/* 印刷の予備（画像方式）: 印刷するときは、ページの画像だけを表示する */
+#printContainer{display:none}
+@media print {
+  body.printing > *:not(#printContainer){display:none!important}
+  html,body.printing{height:100%;margin:0;padding:0;background:#fff!important;display:block!important}
+  body.printing #printContainer{display:block;height:100%}
+  #printContainer > .printedPage{width:100%;height:100%;break-after:page;page-break-after:always;display:flex;align-items:center;justify-content:center;overflow:hidden}
+  #printContainer > .printedPage:last-child{break-after:auto;page-break-after:auto}
+  #printContainer img{max-width:100%;max-height:100%;object-fit:contain;display:block}
+}
+
+/* 印刷ダイアログ */
+.prdlg{display:flex;gap:18px;width:760px;max-width:88vw;max-height:74vh;overflow:auto}
+.pr-opts{flex:1;min-width:300px;font-size:13px}
+.pr-opts h4{margin:12px 0 6px;font-size:13px;color:#333;border-bottom:1px solid #e4e4e4;padding-bottom:3px}
+.pr-opts h4:first-child{margin-top:0}
+.pr-row{display:flex;flex-wrap:wrap;align-items:center;gap:4px 12px;margin:4px 0}
+.pr-row label,.pr-chk{display:inline-flex;align-items:center;gap:4px;white-space:nowrap}
+.pr-row.dis{opacity:.45;pointer-events:none}
+.pr-l{display:flex;align-items:center;gap:8px;margin:4px 0}
+.pr-opts select{padding:3px 4px;min-width:200px}
+#prPages{width:120px;padding:3px 5px}
+#prPct,#prBindMm{width:64px;padding:3px 4px}
+.pr-mm{display:inline-flex;align-items:center;gap:4px}
+#prDup{min-width:200px}
+.pr-note{margin:12px 0 0;font-size:12px;color:#666;line-height:1.5}
+.pr-prev{width:320px;flex:none;display:flex;flex-direction:column;align-items:center;background:#eef0f3;border-radius:6px;padding:10px}
+.pr-cvwrap{height:390px;display:flex;align-items:center;justify-content:center}
+#prCv{box-shadow:0 1px 6px rgba(0,0,0,.3);background:#fff}
+.pr-nav{display:flex;align-items:center;gap:10px;margin-top:8px;font-size:13px}
+.pr-nav button{width:28px;height:26px}
+.pr-info{margin-top:6px;font-size:12px;color:#444;text-align:center;line-height:1.5}
+iframe.printFrame{position:fixed;right:0;bottom:0;width:2px;height:2px;border:0;opacity:0;pointer-events:none}
+@media (max-width:820px){.prdlg{flex-direction:column}.pr-prev{width:auto}}
+
+/* 注釈を埋め込み */
+.embdlg{width:440px;max-width:84vw;display:flex;flex-direction:column;gap:8px;font-size:13px}
+.embdlg label{display:flex;align-items:center;gap:6px}
+/* 保存していない変更の確認 */
+.savedlg{width:460px;max-width:88vw}
+.sv-head{display:flex;gap:10px;align-items:flex-start}
+.sv-ico{width:22px;height:22px;flex:none;color:#0f6cbd;margin-top:1px}
+.sv-head h3{margin:0;font-size:15px;line-height:1.45}
+.sv-msg{margin:10px 0 18px 32px;color:#555;font-size:13px}
+.sv-btn{display:flex;gap:8px;align-items:center}
+.sv-btn button{min-width:84px;padding:6px 14px;border-radius:16px}
+#svYes:focus-visible,#svYes:focus{outline:2px solid #0f6cbd;outline-offset:2px}

@@ -1,0 +1,4 @@
+pdf.min.mjs は PDF.js (Apache-2.0, https://github.com/mozilla/pdf.js) の pdfjs-dist 5.4.296 を、次の1か所だけ改変したものです。
+  CanvasGraphics.getScaleForStroking(): 「デバイスピクセルより細い線を、必ず1ピクセル幅に広げる」処理の下限値 1 を
+  globalThis.__EPA_MINW に置き換え。viewer.js が 0 を設定し、細線は実寸（補正なし）で描かれます。
+他の処理は変更していません。ライセンスは lib/LICENSE-pdfjs.txt を参照してください。
