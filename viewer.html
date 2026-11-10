@@ -79,6 +79,8 @@
         <svg viewBox="0 0 24 24"><ellipse cx="12" cy="12" rx="8.5" ry="6.5" stroke="currentColor" stroke-width="2" fill="none"/></svg><span>丸・楕円</span></button>
       <button class="tool" data-tool="polyline" type="button" title="折れ線 (P)　クリックで頂点追加、ダブルクリック/Enterで確定">
         <svg viewBox="0 0 24 24"><path d="M3 18L9 7l6 9 6-11" stroke="currentColor" stroke-width="2" fill="none"/></svg><span>折れ線</span></button>
+      <button class="tool" data-tool="polygon" type="button" title="多角形 (N)　クリックで頂点追加、ダブルクリック/Enterで閉じて確定">
+        <svg viewBox="0 0 24 24"><path d="M12 3.5l8 6-3 10H7l-3-10z" stroke="currentColor" stroke-width="2" fill="none" stroke-linejoin="round"/></svg><span>多角形</span></button>
       <button class="tool" data-tool="cloud" type="button" title="雲形 (C)　クリックで頂点を追加、ダブルクリック/Enterで閉じて確定。ドラッグすると四角形の雲になります">
         <svg viewBox="0 0 24 24"><path d="M7.5 18a4.2 4.2 0 0 1-.6-8.3 5.3 5.3 0 0 1 10-.3A4.3 4.3 0 0 1 17 18z" stroke="currentColor" stroke-width="2" fill="none" stroke-linejoin="round"/></svg><span>雲形</span></button>
       <button class="tool" data-tool="text" type="button" title="テキストコメント (T)　クリックで配置、ドラッグで幅を指定">
@@ -209,7 +211,8 @@
           <li>ページの整理: 左サイドバーの「ページの整理」。サムネイルをダブルクリックすると、変更を反映してそのページを開きます</li>
           <li>丸・楕円(E): ドラッグで楕円、Shiftを押しながらで正円。選択すると四角のハンドルで大きさを変えられます</li>
           <li>Shift: 直線・折れ線は45°刻み、四角形は正方形、丸・楕円は正円</li>
-          <li>折れ線: クリックで頂点追加／ダブルクリック・Enter・Escで確定／Backspaceで1点戻る</li>
+          <li>折れ線・多角形: クリックで頂点追加／ダブルクリック・Enter・Escで確定／Backspaceで1点戻る</li>
+          <li>頂点の編集: 折れ線・多角形・雲形・直線（Acrobat などで作ったものも）を選ぶと頂点にハンドルが出ます。ドラッグで移動、辺をダブルクリックで頂点を追加、Alt+クリックで頂点を削除</li>
           <li>テキスト(T): クリックで配置、ドラッグで幅を指定。Ctrl+Enter・Esc・画面のクリックで確定。選択すると四隅のハンドルで拡大縮小（フォントサイズも変わる）、右辺の中央で幅を変更</li>
           <li>画像スタンプ: 画像をコピーしてCtrl+V（画像ファイルのドロップも可）。角のハンドルで拡大縮小</li>
           <li>日付印: 左サイドバーの「日付印」で貼り付け、⚙で部名・日付・名前などを設定</li>

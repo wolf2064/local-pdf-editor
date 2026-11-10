@@ -5,7 +5,7 @@ PCに保存したPDFを、ブラウザー（Chrome / Edge）で開いてその�
 
 ## 主な機能
 - **内容の編集**: PDF内の文字の書き換え、図形（ベクター）の移動・拡大縮小・回転・色の変更・削除・複製、配置順の変更
-- **注釈**: 直線・矢印・四角形・丸・折れ線・雲形・テキスト・手書き、画像スタンプ、日付印
+- **注釈**: 直線・矢印・四角形・丸・折れ線・多角形・雲形・テキスト・手書き、画像スタンプ、日付印。Acrobat などで作った直線・折れ線・多角形・雲形の頂点編集
 - **ページ**: 回転・並べ替え・挿入・削除・抽出
 - **印刷**: 範囲・用紙・倍率・向き・とじしろ・片面／両面を指定（プレビュー付き）
 - **その他**: 注釈埋め込み、文書プロパティの編集、編集ロック（権限パスワード）の解除
@@ -26,5 +26,5 @@ PCに保存したPDFを、ブラウザー（Chrome / Edge）で開いてその�
 [プライバシーポリシー](https://wolf2064.github.io/local-pdf-editor/privacy.html)
 
 ## 使用しているライブラリ
-- [PDF.js](https://github.com/mozilla/pdf.js)（Apache License 2.0）— `lib/pdf.min.mjs` は1か所だけ改変（[lib/PATCH-NOTE.txt](lib/PATCH-NOTE.txt)）
+- [PDF.js](https://github.com/mozilla/pdf.js)（Apache License 2.0）— `lib/pdf.min.mjs` は2か所だけ改変（[lib/PATCH-NOTE.txt](lib/PATCH-NOTE.txt)）
 - [pdf-lib](https://github.com/Hopding/pdf-lib)（MIT License）

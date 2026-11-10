@@ -1,4 +1,7 @@
-pdf.min.mjs は PDF.js (Apache-2.0, https://github.com/mozilla/pdf.js) の pdfjs-dist 5.4.296 を、次の1か所だけ改変したものです。
-  CanvasGraphics.getScaleForStroking(): 「デバイスピクセルより細い線を、必ず1ピクセル幅に広げる」処理の下限値 1 を
-  globalThis.__EPA_MINW に置き換え。viewer.js が 0 を設定し、細線は実寸（補正なし）で描かれます。
+pdf.min.mjs は PDF.js (Apache-2.0, https://github.com/mozilla/pdf.js) の pdfjs-dist 5.4.296 を、次の2か所だけ改変したものです。
+1. CanvasGraphics.getScaleForStroking(): 「デバイスピクセルより細い線を、必ず1ピクセル幅に広げる」処理の下限値 1 を
+   globalThis.__EPA_MINW に置き換え。viewer.js が 0 を設定し、細線は実寸（補正なし）で描かれます。
+2. TilingPattern.getPattern(): タイリングパターン（繰り返し模様の塗り）のタイル画像を、同じページの描画命令ごとにキャッシュして再利用
+   （色・変換行列・タイルの大きさ・描画先の大きさが同じときだけ）。網掛けなどが多いページの描画を速くします。
+   globalThis.__EPA_PCACHE = false でキャッシュを無効にできます。
 他の処理は変更していません。ライセンスは lib/LICENSE-pdfjs.txt を参照してください。

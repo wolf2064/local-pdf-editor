@@ -1,10 +1,10 @@
 import * as pdfjsLib from './lib/pdf.min.mjs';
 import { createContentEditor } from './pdfedit.js';
 import { createPdfUnlocker } from './pdfcrypt.js';
-/* ローカルPDFエディター v4.8 — ビューア本体（viewer.html から読み込まれる）
+/* ローカルPDFエディター v4.10 — ビューア本体（viewer.html から読み込まれる）
  *
  * 使っているライブラリ（すべて lib/ に同梱。インターネットには接続しない）
- *   - PDF.js  : 表示・文字の選択・暗号化PDFの読み込み（lib/pdf.min.mjs は細線の最小線幅を0にするため1か所だけ改変）
+ *   - PDF.js  : 表示・文字の選択・暗号化PDFの読み込み（lib/pdf.min.mjs は2か所だけ改変: 細線の最小線幅、タイリングパターンのキャッシュ。lib/PATCH-NOTE.txt）
  *   - pdf-lib : 注釈の書き込み・ページ操作・保存
  *   - pdfedit.js  : PDF内の文字・図形（ベクター）を直接書き換えるエンジン（「内容を編集」）
  *   - pdfcrypt.js : 編集ロック（権限パスワード）の解除
@@ -79,8 +79,24 @@ const NATIVE_LABEL = { Text: 'ノート', FreeText: 'テキストボックス', 
   PolyLine: '折れ線', Highlight: 'ハイライト', Underline: '下線', Squiggly: '波線', StrikeOut: '取り消し線', Stamp: 'スタンプ',
   Caret: '挿入記号', Ink: '手描き', FileAttachment: '添付ファイル', Sound: '音声' };
 const NATIVE_RESIZABLE = new Set(['FreeText', 'Square', 'Circle', 'Stamp', 'Ink', 'Line', 'PolyLine', 'Polygon']);
-const OURS_LABEL = { edit: '内容の編集', asel: '注釈選択', ink: '手書き', line: '直線', rect: '四角形', ellipse: '円・楕円', polyline: '折れ線', cloud: '雲形', text: 'テキストコメント', stamp: 'スタンプ（画像）' };
-const isMulti = (t) => t === 'polyline' || t === 'cloud';
+const NATIVE_VERTEX = new Set(['Line', 'PolyLine', 'Polygon']);      // 頂点を編集できる既存の注釈（Polygon は雲形も含む）
+// 既存の注釈の頂点。Acrobat の多角形は、最後に最初の頂点をもう一度入れる（dup）ので、編集中はそれを除いて扱う
+function nativePts(n) {
+  if (!NATIVE_VERTEX.has(n.subtype)) return null;
+  if (n.subtype === 'Line') return n.line && n.line.length >= 4 ? { pts: [[n.line[0], n.line[1]], [n.line[2], n.line[3]]], dup: false } : null;
+  if (!n.verts || n.verts.length < 2) return null;
+  const pts = n.verts.map((q) => q.slice()); let dup = false;
+  if (n.subtype === 'Polygon' && pts.length > 3) {
+    const a = pts[0], b = pts[pts.length - 1];
+    if (Math.hypot(a[0] - b[0], a[1] - b[1]) < 0.01) { pts.pop(); dup = true; }
+  }
+  return { pts, dup };
+}
+const nativeMinPts = (n) => (n.subtype === 'Polygon' ? 3 : 2);
+const OURS_LABEL = { edit: '内容の編集', asel: '注釈選択', ink: '手書き', line: '直線', rect: '四角形', ellipse: '円・楕円', polyline: '折れ線', polygon: '多角形', cloud: '雲形', text: 'テキストコメント', stamp: 'スタンプ（画像）' };
+const isMulti = (t) => t === 'polyline' || t === 'polygon' || t === 'cloud';
+const isClosedT = (t) => t === 'polygon' || t === 'cloud';            // 閉じた図形（最後の頂点と最初の頂点をつなぐ）
+const minPts = (t) => (isClosedT(t) ? 3 : 2);
 /* ---------------------------------------------------------------- utils */
 const n3 = (v) => String(+Number(v).toFixed(3));
 const clamp = (v, a, b) => Math.min(b, Math.max(a, v));
@@ -260,6 +276,7 @@ function shapePrims(a) {
     const cp = cloudPath(a.pts, a.p.intensity || 1);
     return [{ k: 'bez', start: cp.start, segs: cp.segs, closed: true, fill, main: true }];
   }
+  if (a.type === 'polygon') return [{ k: 'path', pts: a.pts.map((p) => p.slice()), closed: a.pts.length >= 3, fill: fill && a.pts.length >= 3, main: true }];
   const pts = a.pts.map((p) => p.slice());
   const ends = [];
   if (pts.length >= 2) {
@@ -536,13 +553,14 @@ async function addAnnotToPage(doc, page, a, cache) {
     R = [x0 - pad, y0 - pad, x1 + pad, y1 + pad].map(Number);
     const ap = ctx.register(ctx.stream(buildAP(a), { Type: 'XObject', Subtype: 'Form', BBox: R, Resources: { ExtGState: { GS0: gs } } }));
     const dash = dashArr(a.p);
-    dict = { ...base, Subtype: a.type === 'ellipse' ? 'Circle' : rect ? 'Square' : cloud ? 'Polygon' : a.type === 'line' ? 'Line' : 'PolyLine', Rect: R,
+    dict = { ...base, Subtype: a.type === 'ellipse' ? 'Circle' : rect ? 'Square' : isClosedT(a.type) ? 'Polygon' : a.type === 'line' ? 'Line' : 'PolyLine', Rect: R,
       C: hex2rgb(a.p.color),
       BS: dash ? { Type: 'Border', W: w, S: 'D', D: dash } : { Type: 'Border', W: w, S: 'S' },
       EPAStyle: a.p.style, AP: { N: ap } };
     if (a.p.fill) dict.IC = hex2rgb(a.p.fill);
     if (rect && !a.rot) dict.RD = [pad, pad, pad, pad];
     else if (cloud) { dict.Vertices = a.pts.flat(); dict.BE = { S: 'C', I: a.p.intensity || 1 }; }
+    else if (a.type === 'polygon') dict.Vertices = a.pts.flat();
     else {
       dict.LE = [pdfLE(a.p.start), pdfLE(a.p.end)];
       if (a.type === 'line') dict.L = [...a.pts[0], ...a.pts[1]];
@@ -604,7 +622,7 @@ function rasterAnnot(a, k0 = 4) {
 // pdf-lib で読めないPDF（暗号化など）の保存: PDF.js の注釈保存機能で、暗号化を保ったまま追記する
 async function buildViaPdfJs() {
   const perms = await S.pdf.getPermissions();
-  if (perms && !perms.includes(0x20)) { const e = new Error('このPDFは、注釈・スタンプの追加が文書の設定で禁止されているため、書き込めません。'); e.perm = true; throw e; }
+  if (perms && !perms.includes(0x20)) { const e = new Error('このPDFは編集ロックがかかっていて、注釈・スタンプの追加が禁止されているため、保存できません（元のファイルは変更していません）。左の「文書プロパティ」で編集ロックを解除すると保存できます。'); e.perm = true; throw e; }
   const st = S.pdf.annotationStorage, keys = [];
   try {
     let n = 0;
@@ -668,7 +686,7 @@ async function extractOurs(bytes) {
   const L = (o) => (o === undefined ? undefined : ctx.lookup(o));
   const nums = (o) => { const a = L(o); return a ? a.asArray().map((x) => L(x).asNumber()) : null; };
   const txt = (o) => { const s = L(o); return s && s.decodeText ? s.decodeText() : ''; };
-  const TYPES = ['line', 'rect', 'ellipse', 'polyline', 'cloud', 'text', 'stamp', 'ink'];
+  const TYPES = ['line', 'rect', 'ellipse', 'polyline', 'polygon', 'cloud', 'text', 'stamp', 'ink'];
   doc.getPages().forEach((page, pi) => {
     const arr = page.node.Annots();
     if (!arr) return;
@@ -779,7 +797,73 @@ async function collectNatives() {
 }
 const refKey = (r) => `${r.objectNumber} ${r.generationNumber}`;
 function refFromId(id) { const m = /^(\d+)R(\d*)$/.exec(id); if (!m) throw new Error('注釈IDを解釈できません: ' + id); return PDFRef.of(+m[1], m[2] ? +m[2] : 0); }
-// 既存のテキスト注釈（FreeText）の外観を、変更後の文字・色で作り直す
+// 既存のテキスト注釈（FreeText）の外観を、変更後の文字で作り直す（v4.9）
+//  ・元の外観（背景・枠線）が読めるときは、そのまま残して「文字だけ」を入れ替える。外観の /Matrix（平行移動・拡大縮小・回転）も正しく扱う
+//  ・文字の色は、「実際に見えている色」を優先する。Acrobat・Edgeで作ったテキストボックスは、/DA・/DS に古い色（白など）が残り、
+//    本当の色は外観ストリームや /RC（リッチテキスト）にだけ入っていることがある。順番: ①外観ストリームの文字の色 → ②/RC の色 → ③/DA の色
+//  ・背景と同じ色の文字になって見えなくなる場合（白い箱に白い文字など）は、文字の色を黒に直す
+//  ・元の外観が読めないときは、設定値から作る。/C は枠線の色（背景ではない）
+const ftxLum = (c) => 0.299 * c[0] + 0.587 * c[1] + 0.114 * c[2];
+const ftxSame = (a, b) => !!a && !!b && Math.abs(ftxLum(a) - ftxLum(b)) < 0.25 && Math.hypot(a[0] - b[0], a[1] - b[1], a[2] - b[2]) < 0.6;
+const ftxMul = (a, b) => [a[0] * b[0] + a[1] * b[2], a[0] * b[1] + a[1] * b[3], a[2] * b[0] + a[3] * b[2], a[2] * b[1] + a[3] * b[3], a[4] * b[0] + a[5] * b[2] + b[4], a[4] * b[1] + a[5] * b[3] + b[5]];
+// 外観ストリームの内容（文字列）。読めないときは null
+function ftxApText(ctx, apObj) {
+  try {
+    const st = ctx.lookup(apObj); if (!st || !st.dict) return null;
+    const bytes = st instanceof window.PDFLib.PDFRawStream ? window.PDFLib.decodePDFRawStream(st).decode() : st.getContents();
+    if (!bytes || bytes.length > 2e6) return null;
+    let s = ''; for (let i = 0; i < bytes.length; i += 8192) s += String.fromCharCode.apply(null, bytes.subarray(i, i + 8192));
+    return s;
+  } catch (e) { return null; }
+}
+const ftxBT = /(^|[\s>\]\)])BT(?=[\s<(\[\/])[\s\S]*?[\s>\]\)]ET(?=[\s]|$)/g;
+// 外観ストリームから、文字（BT〜ET）の部分を取り除く。インライン画像を含むものは null
+function ftxStripText(s) {
+  if (s === null || /(^|[\s>\]])BI(\s|$)/.test(s)) return null;
+  return s.replace(ftxBT, '$1');
+}
+// 外観ストリームの文字の色: 最初の文字を描く直前の「塗りの色」を、グラフィックス状態（q / Q）まで追って求める。なければ null
+function ftxApColor(s) {
+  if (s === null) return null;
+  const bt = /(^|[\s>\]\)])BT(?=[\s<(\[\/])/.exec(s);
+  if (!bt) return null;
+  const from = bt.index + bt[0].length - 2, tail = s.slice(from);
+  const sh = tail.search(/(<[0-9A-Fa-f\s]*>|\((?:\\.|[^\\)])*\)|\])\s*(Tj|TJ|'|")/);
+  if (sh < 0) return null;
+  const pre = s.slice(0, from + sh);
+  let col = [0, 0, 0], c; const stack = [];
+  const re = /(?:^|\s)(?:((?:-?[\d.]+\s+){1,4})(rg|g|k|sc|scn)|(q|Q))(?=\s|$)/g;
+  while ((c = re.exec(pre))) {
+    if (c[3] === 'q') { stack.push(col); continue; }
+    if (c[3] === 'Q') { if (stack.length) col = stack.pop(); continue; }
+    const v = c[1].trim().split(/\s+/).map(Number), n = v.length;
+    if (c[2] === 'rg' || ((c[2] === 'sc' || c[2] === 'scn') && n === 3)) { if (n >= 3) col = v.slice(-3); }
+    else if (c[2] === 'g' || ((c[2] === 'sc' || c[2] === 'scn') && n === 1)) { if (n >= 1) col = [v[n - 1], v[n - 1], v[n - 1]]; }
+    else if (c[2] === 'k' || ((c[2] === 'sc' || c[2] === 'scn') && n === 4)) { if (n >= 4) { const w = v.slice(-4), k = 1 - w[3]; col = [(1 - w[0]) * k, (1 - w[1]) * k, (1 - w[2]) * k]; } }
+  }
+  return col.every((x) => Number.isFinite(x)) ? col.map((x) => Math.min(1, Math.max(0, x))) : null;
+}
+// リッチテキスト（/RC）の最初の文字の色（style="color:#RRGGBB"。span → 全体の順）
+function ftxRcColor(rc) {
+  if (!rc) return null;
+  const all = [...String(rc).matchAll(/color\s*:\s*#([0-9a-fA-F]{6})/g)].map((m) => m[1]);
+  if (!all.length) return null;
+  const sp = /<span[^>]*color\s*:\s*#([0-9a-fA-F]{6})/.exec(rc), hex = sp ? sp[1] : all[0];
+  return [0, 2, 4].map((i) => parseInt(hex.slice(i, i + 2), 16) / 255);
+}
+// 外観ストリーム（文字を除いたもの）で、最初に塗りつぶされる色（背景）。塗りがなければ null
+function ftxFillOf(s) {
+  let col = [0, 0, 0], c;
+  const re = /(?:^|\s)(?:((?:-?[\d.]+\s+){1,4})(rg|g|k)|(f\*?|F|B\*?|b\*?))(?=\s|$)/g;
+  while ((c = re.exec(s))) {
+    if (c[3]) return col;
+    const v = c[1].trim().split(/\s+/).map(Number);
+    if (c[2] === 'rg' && v.length >= 3) col = v.slice(-3);
+    else if (c[2] === 'g' && v.length >= 1) col = [v[v.length - 1], v[v.length - 1], v[v.length - 1]];
+    else if (c[2] === 'k' && v.length >= 4) { const k = 1 - v[v.length - 1], w = v.slice(-4); col = [(1 - w[0]) * k, (1 - w[1]) * k, (1 - w[2]) * k]; }
+  }
+  return null;
+}
 function regenFreeText(doc, d) {
   const ctx = doc.context, N = (k) => PDFName.of(k);
   const L = (o) => (o === undefined ? undefined : ctx.lookup(o));
@@ -791,19 +875,97 @@ function regenFreeText(doc, d) {
   const da = parseDA(str(d.get(N('DA'))));
   const qn = L(d.get(N('Q'))), q = qn && qn.asNumber ? qn.asNumber() : 0;
   const rn = L(d.get(N('Rotate'))), rot = rn && rn.asNumber ? normRot(rn.asNumber()) : 0;
-  const bs = L(d.get(N('BS'))), bwo = bs instanceof PDFDict ? L(bs.get(N('W'))) : null;
-  const bw = bwo && bwo.asNumber ? bwo.asNumber() : 0;
-  const C = nums(d.get(N('C'))), IC = nums(d.get(N('IC')));
-  const col3 = (a) => (a && a.length >= 3 ? a.slice(0, 3) : a && a.length === 1 ? [a[0], a[0], a[0]] : null);
-  const fill = col3(IC) || (col3(C) && bw === 0 ? col3(C) : null);
-  const bcolor = col3(C) || da.rgb;
-  const w = R[2] - R[0], h = R[3] - R[1];
   const ca = L(d.get(N('CA'))), opacity = ca && ca.asNumber ? ca.asNumber() : 1;
-  const ap = buildTextAP(doc, { w: rot % 180 ? h : w, h: rot % 180 ? w : h, rot, text, fs: da.fs, rgb: da.rgb, fill, bw, bcolor, opacity, q, pad: 2 });
+  const w = R[2] - R[0], h = R[3] - R[1];
+  const col3 = (a) => (a && a.length >= 3 ? a.slice(0, 3) : a && a.length === 1 ? [a[0], a[0], a[0]] : null);
+  const C = col3(nums(d.get(N('C')))), IC = col3(nums(d.get(N('IC'))));
+  const apD = L(d.get(N('AP'))), apN = apD instanceof PDFDict ? apD.get(N('N')) : null, apS = apN ? L(apN) : null;
+  const apTxt = apS && apS.dict ? ftxApText(ctx, apN) : null;
+  // ---- 文字の色: 実際に見えている色を優先（外観ストリーム → /RC → /DA）
+  let rgb = ftxApColor(apTxt) || ftxRcColor(str(d.get(N('RC')))) || da.rgb;
+  let dict = null, hasJp = false;
+  // ---- ① 元の外観を残して、文字だけ入れ替える
+  const bb = apS && apS.dict ? nums(apS.dict.get(N('BBox'))) : null;
+  const mt = apS && apS.dict ? nums(apS.dict.get(N('Matrix'))) : null;
+  const res = apS && apS.dict ? L(apS.dict.get(N('Resources'))) : null;
+  if (bb && bb.length === 4 && !rot && res instanceof PDFDict && w > 0 && h > 0) {
+    const kept = ftxStripText(apTxt);
+    if (kept !== null) {
+      // 外観を注釈の枠（Rect）に合わせる変換（PDFの規格どおり）: 外観の座標 →（Matrix）→ BBoxをRectに合わせる
+      const M = mt && mt.length === 6 ? mt : [1, 0, 0, 1, 0, 0];
+      const xs = [], ys = [];
+      for (const [x, y] of [[bb[0], bb[1]], [bb[2], bb[1]], [bb[0], bb[3]], [bb[2], bb[3]]]) { xs.push(M[0] * x + M[2] * y + M[4]); ys.push(M[1] * x + M[3] * y + M[5]); }
+      const tx0 = Math.min(...xs), ty0 = Math.min(...ys), tw = Math.max(...xs) - tx0, th = Math.max(...ys) - ty0;
+      if (tw > 1e-6 && th > 1e-6) {
+        const sx = w / tw, sy = h / th, T = ftxMul(M, [sx, 0, 0, sy, -tx0 * sx, -ty0 * sy]);
+        // 背景（塗り）が文字と同じ色で見えなくなるときは、文字を黒にする
+        const bg = ftxFillOf(kept);
+        if (bg && ftxSame(bg, rgb)) rgb = [0, 0, 0];
+        const refs = fontRefs(doc), Lo = layoutText(text, da.fs, w, { q, pad: 2 });
+        hasJp = Lo.hasJp;
+        const ops = [`q`, `${T.map(n3).join(' ')} cm`, kept, `Q`, `q`, `0 0 ${n3(w)} ${n3(h)} re W n`, `/EPAGS gs`, `${rgb.map(n3).join(' ')} rg`];
+        Lo.lines.forEach((ln, i) => {
+          const y = h - Lo.pad - i * Lo.lh - Lo.b;
+          for (const r of ln.runs) { if (r.t.trim() === '') continue; ops.push(`BT /${r.f === 'l' ? 'Helv' : 'EPAJp'} ${n3(da.fs)} Tf ${n3(r.x)} ${n3(y)} Td <${r.f === 'l' ? hexLat(r.t) : hexU16(r.t)}> Tj ET`); }
+        });
+        ops.push('Q');
+        const nres = ctx.obj({});                                           // 元の Resources を写し、文字用のフォントと透明度だけ足す（元の辞書は変更しない）
+        for (const [k, v] of res.entries()) nres.set(k, v);
+        const fo = L(res.get(N('Font'))), nf = ctx.obj({});
+        if (fo instanceof PDFDict) for (const [k, v] of fo.entries()) nf.set(k, v);
+        nf.set(N('Helv'), refs.helv); nf.set(N('EPAJp'), refs.jp); nres.set(N('Font'), nf);
+        const eo = L(res.get(N('ExtGState'))), ne = ctx.obj({});
+        if (eo instanceof PDFDict) for (const [k, v] of eo.entries()) ne.set(k, v);
+        ne.set(N('EPAGS'), ctx.obj({ Type: 'ExtGState', CA: opacity, ca: opacity })); nres.set(N('ExtGState'), ne);
+        const nref = ctx.register(ctx.stream(ops.join('\n'), { Type: 'XObject', Subtype: 'Form', BBox: [0, 0, w, h] }));
+        ctx.lookup(nref).dict.set(N('Resources'), nres);
+        dict = nref;
+      }
+    }
+  }
+  // ---- ② 読めないときは、設定値から作る
+  if (!dict) {
+    const bs = L(d.get(N('BS'))), bwo = bs instanceof PDFDict ? L(bs.get(N('W'))) : null, bo = nums(d.get(N('Border')));
+    const bw = bwo && bwo.asNumber ? bwo.asNumber() : (bo && bo.length >= 3 ? bo[2] : 1);       // 枠線の太さ: /BS → /Border → 既定の1
+    let fill = IC, bcolor = null;
+    if (bw > 0) bcolor = C || rgb;                                                          // 枠線の色は /C（背景ではない）
+    else if (!IC && C) fill = C;                                                            // 枠線がなく /IC もない: /C を背景色として使う作成ソフトがある
+    if (fill && ftxSame(fill, rgb)) rgb = [0, 0, 0];                                        // 背景と同じ色の文字は見えないので黒にする
+    if (bcolor && fill && ftxSame(bcolor, fill)) bcolor = null;
+    const ap = buildTextAP(doc, { w: rot % 180 ? h : w, h: rot % 180 ? w : h, rot, text, fs: da.fs, rgb, fill, bw: bcolor ? bw : 0, bcolor: bcolor || rgb, opacity, q, pad: 2 });
+    hasJp = ap.hasJp; dict = ap.ref;
+  }
   ensureDR(doc);
-  d.set(N('AP'), ctx.obj({ N: ap.ref }));
-  d.set(N('DA'), PDFString.of(daString(ap.hasJp ? 'EPAJp' : 'Helv', da.fs, da.rgb)));
+  d.set(N('AP'), ctx.obj({ N: dict }));
+  d.set(N('DA'), PDFString.of(daString(hasJp ? 'EPAJp' : 'Helv', da.fs, rgb)));              // /DA も、実際の文字の色に直す（次に編集したときに、また白になるのを防ぐ）
   d.delete(N('RC')); d.delete(N('DS'));
+}
+// 既存の直線・折れ線・多角形・雲形の外観（見た目）を、新しい頂点で作り直す。色・太さ・破線・塗り・不透明度・線端・雲の大きさは、注釈の設定から読む
+// （Acrobat などで作った注釈も、作成者・コメント・返信などはそのまま残し、形と外観だけを変える）
+function regenShapeAP(doc, d, pts) {
+  const ctx = doc.context, N = (k) => PDFName.of(k), L = (o) => (o === undefined ? undefined : ctx.lookup(o));
+  const nums = (o) => { const a = L(o); return a instanceof PDFArray ? a.asArray().map((x) => { const v = L(x); return v && v.asNumber ? v.asNumber() : 0; }) : null; };
+  const name = (o) => { const v = L(o); return v && v.asString ? v.asString().slice(1) : ''; };
+  const col = (a) => (!a || !a.length ? null : a.length >= 4 ? (() => { const k = 1 - a[3]; return [(1 - a[0]) * k, (1 - a[1]) * k, (1 - a[2]) * k]; })()
+    : a.length >= 3 ? a.slice(0, 3) : [a[0], a[0], a[0]]);
+  const sub = name(d.get(N('Subtype'))), be = L(d.get(N('BE')));
+  const cloud = sub === 'Polygon' && be instanceof PDFDict && name(be.get(N('S'))) === 'C';
+  const type = sub === 'Line' ? 'line' : sub === 'PolyLine' ? 'polyline' : cloud ? 'cloud' : 'polygon';
+  let w = 1, style = 'solid';
+  const bs = L(d.get(N('BS')));
+  if (bs instanceof PDFDict) { const wv = L(bs.get(N('W'))); if (wv && wv.asNumber) w = wv.asNumber(); if (name(bs.get(N('S'))) === 'D') style = 'dashed'; }
+  else { const bo = nums(d.get(N('Border'))); if (bo && bo.length >= 3) w = bo[2]; }
+  const ends = new Set(LINE_ENDS.map((x) => x[0]));
+  const le = L(d.get(N('LE'))), leN = le instanceof PDFArray ? le.asArray().map((x) => name(x)) : [];
+  const ca = L(d.get(N('CA'))), op = ca && ca.asNumber ? ca.asNumber() : 1;
+  const iv = be instanceof PDFDict ? L(be.get(N('I'))) : null;
+  const C = col(nums(d.get(N('C')))), IC = col(nums(d.get(N('IC'))));
+  const a = { type, pts, p: { color: rgb2hex(C || [0, 0, 0]), width: Math.max(w, 0.01), style, fill: IC && sub !== 'Line' && sub !== 'PolyLine' ? rgb2hex(IC) : null, opacity: op * 100,
+    start: ends.has(leN[0]) ? leN[0] : 'None', end: ends.has(leN[1]) ? leN[1] : 'None', startSize: 100, endSize: 100, intensity: iv && iv.asNumber ? iv.asNumber() : 1, radius: 0 } };
+  const [x0, y0, x1, y1] = primsBBox(shapePrims(a)), pad = Math.max(w * 1.5, 1) + 1;
+  const R = [x0 - pad, y0 - pad, x1 + pad, y1 + pad];
+  const ap = ctx.register(ctx.stream(buildAP(a), { Type: 'XObject', Subtype: 'Form', BBox: R, Resources: { ExtGState: { GS0: { Type: 'ExtGState', CA: op, ca: op } } } }));
+  d.set(N('Rect'), ctx.obj(R)); d.set(N('AP'), ctx.obj({ N: ap })); d.delete(N('RD'));
 }
 // PDFにもともとあった注釈（コメント）の変更・削除・配置順の変更を、元のPDFに直接反映する
 async function nativeEdit(ops) {
@@ -844,6 +1006,12 @@ async function nativeEdit(ops) {
       d.set(N('Contents'), PDFHexString.fromText(op.text));
       d.delete(N('RC')); d.set(N('M'), PDFString.of(pdfDate()));
       if (subOf(d) === 'FreeText') regenFreeText(doc, d);
+    } else if (op.type === 'verts') {          // 直線・折れ線・多角形（雲形）の頂点を変更し、外観を作り直す
+      if (!d) continue;
+      if (subOf(d) === 'Line') d.set(N('L'), ctx.obj([...op.pts[0], ...op.pts[1]]));
+      else d.set(N('Vertices'), ctx.obj((op.dup ? [...op.pts, op.pts[0]] : op.pts).flat()));
+      regenShapeAP(doc, d, op.pts);
+      d.set(N('M'), PDFString.of(pdfDate()));
     } else if (op.type === 'resize') {
       if (!d) continue;
       const [ox0, oy0, ox1, oy1] = op.old, [nx0, ny0, nx1, ny1] = op.rect;
@@ -1571,7 +1739,7 @@ function drawAnnot(p, a, parent, { draft = false } = {}) {
     else svgEl('path', { d: toD(pr), ...common }, g);
   }
   if (!draft) {
-    const filled = ((a.type === 'rect' || a.type === 'ellipse' || a.type === 'cloud') && a.p.fill) || (ink && prims.some((pr) => pr.fill));
+    const filled = ((a.type === 'rect' || a.type === 'ellipse' || isClosedT(a.type)) && a.p.fill) || (ink && prims.some((pr) => pr.fill));
     const hit = svgEl('path', { d: mainD, class: 'hit', fill: 'none', stroke: 'rgba(0,0,0,0)', 'stroke-width': Math.max(maxW * sc, 1) + 8,
       'pointer-events': filled ? 'all' : 'stroke' }, g);
     hit.dataset.id = a.id;
@@ -1630,6 +1798,20 @@ function drawNative(p, n, parent) {
   if (rs) {
     const [a0, b0, a1, b1] = rs.vr;
     svgEl('rect', { x: a0, y: b0, width: a1 - a0, height: b1 - b0, fill: 'rgba(15,108,189,.10)', stroke: '#0f6cbd', 'stroke-width': 1.5, 'stroke-dasharray': '5 3', 'pointer-events': 'none' }, g);
+    return;
+  }
+  const vd = S.drag && S.drag.mode === 'nvert' && S.drag.n === n ? S.drag : null;
+  if (vd) {           // 頂点を動かしている途中: 新しい形を点線で表示
+    svgEl('path', { d: pathOf(vd.pts.map((q) => [q[0] - dr[0], q[1] - dr[1]]), n.subtype === 'Polygon'), fill: 'none', stroke: '#0f6cbd', 'stroke-width': 1.5, 'stroke-dasharray': '5 3', 'pointer-events': 'none' }, g);
+  }
+  const np = sel && S.sel.size === 1 ? nativePts(n) : null;
+  if (np) {           // 直線・折れ線・多角形・雲形: 頂点のハンドル（ドラッグで移動、Alt+クリックで削除）
+    (vd ? vd.pts : np.pts).forEach((q, i) => {
+      const [hx, hy] = vpt(view, q);
+      const hd = svgEl('circle', { cx: hx, cy: hy, r: 5, fill: '#fff', stroke: '#0f6cbd', 'stroke-width': 2, class: 'nh', 'pointer-events': 'all' }, parent);
+      hd.dataset.nv = i; hd.dataset.nid = n.key;
+    });
+    if (!vd) svgEl('path', { d: pathOf(np.pts, n.subtype === 'Polygon'), fill: 'none', stroke: '#0f6cbd', 'stroke-width': 1, 'stroke-dasharray': '4 3', 'pointer-events': 'none' }, g);
     return;
   }
   if (sel) {
@@ -1794,7 +1976,7 @@ function mapAnnot(a, orig, f) {
 /** 注釈を点 C のまわりに deg 度（反時計回り）回す */
 function rotateAnnot(a, orig, C, deg) {
   const R = (q) => rotPt(q, C, deg);
-  if (a.type === 'line' || a.type === 'polyline' || a.type === 'cloud' || a.type === 'ink') { mapAnnot(a, orig, R); return; }
+  if (a.type === 'line' || a.type === 'polyline' || a.type === 'polygon' || a.type === 'cloud' || a.type === 'ink') { mapAnnot(a, orig, R); return; }
   if (a.type === 'text') { a.pts = [R(orig.pts[0])]; a.rot = normDeg((orig.rot || 0) + deg); return; }
   const c = pivotOf(orig), c2 = R(c);
   a.pts = orig.pts.map((q) => [q[0] + c2[0] - c[0], q[1] + c2[1] - c[1]]);
@@ -1823,7 +2005,7 @@ async function deleteSelectedAnnots() {
   redrawAll(); commit(sn); syncProps(); updateButtons();
   toast(`${keys.length}個の注釈を削除しました`);
 }
-const INKABLE = new Set(['line', 'rect', 'ellipse', 'polyline', 'cloud', 'ink']);
+const INKABLE = new Set(['line', 'rect', 'ellipse', 'polyline', 'polygon', 'cloud', 'ink']);
 /** 選択した図形の注釈を、1つの手書き（Ink）注釈にまとめる */
 function convertToInk() {
   const all = selOurs(), conv = all.filter((a) => INKABLE.has(a.type));
@@ -1909,6 +2091,7 @@ function syncEndSize(p) {
 }
 const CAPS = {
   line: ['start', 'end', 'style', 'width', 'color', 'fill', 'opacity'], polyline: ['start', 'end', 'style', 'width', 'color', 'fill', 'opacity', 'radius'],
+  polygon: ['style', 'width', 'color', 'fill', 'opacity'],
   cloud: ['style', 'width', 'color', 'fill', 'opacity', 'intensity'], ink: ['width', 'color', 'opacity'],
   rect: ['style', 'width', 'color', 'fill', 'opacity', 'radius'], ellipse: ['style', 'width', 'color', 'fill', 'opacity'], text: ['width', 'color', 'fill', 'opacity', 'font'],
   stamp: ['opacity'], native: [], none: ['start', 'end', 'style', 'width', 'color', 'fill', 'opacity'],
@@ -1949,10 +2132,12 @@ function syncProps() {
   P.width.min = kind === 'text' ? '0' : '0.25';
   $('#natBox').style.display = nat ? '' : 'none';
   $('#hintEnds').textContent = nat
-    ? (NATIVE_RESIZABLE.has(nat.subtype) ? '※ドラッグで移動／四角のハンドルでサイズ変更／ダブルクリックで内容を編集' : '※ドラッグで移動／ダブルクリックで内容を編集（この種類はサイズ変更できません）')
+    ? (NATIVE_VERTEX.has(nat.subtype) ? `※ドラッグで移動／頂点のハンドルをドラッグで形を変更${nat.subtype === 'Line' ? '' : '・辺をダブルクリックで頂点を追加・Alt+クリックで頂点を削除'}／Enterで内容を編集`
+      : NATIVE_RESIZABLE.has(nat.subtype) ? '※ドラッグで移動／四角のハンドルでサイズ変更／ダブルクリックで内容を編集' : '※ドラッグで移動／ダブルクリックで内容を編集（この種類はサイズ変更できません）')
     : kind === 'rect' ? '※四角形には始点/終点はありません'
       : kind === 'ellipse' ? '※ドラッグで楕円（Shiftで正円）。四角のハンドルで大きさを変更'
       : kind === 'cloud' ? '※クリックで頂点を追加、ダブルクリック/Enterで閉じて確定。ドラッグすると四角形の雲になります'
+      : kind === 'polygon' ? '※クリックで頂点を追加、ダブルクリック/Enter/Escで閉じて確定。選択中は、頂点をドラッグ／辺をダブルクリックで頂点を追加／Alt+クリックで頂点を削除'
         : kind === 'text' ? '※ダブルクリックまたはEnterで文字を編集'
           : kind === 'stamp' ? '※四角のハンドルで拡大縮小（Shiftで縦横比を解除）' : '';
 }
@@ -2038,7 +2223,7 @@ function addAnnot(a, opts = {}) {
   if (!a.author) a.author = S.author;
   if (!a.date) a.date = new Date().toISOString();
   S.annots.push(a); commit(snap);
-  const pin = $('#chkPin').checked && ['line', 'rect', 'ellipse', 'polyline', 'cloud'].includes(a.type) && !opts.forceSelect;
+  const pin = $('#chkPin').checked && ['line', 'rect', 'ellipse', 'polyline', 'polygon', 'cloud'].includes(a.type) && !opts.forceSelect;
   if (pin) { S.selId = null; redrawPage(pageOf(a)); syncProps(); }
   else { S.selId = a.id; redrawPage(pageOf(a)); setTool('select'); }
   scheduleList();
@@ -2055,6 +2240,7 @@ async function nativeOp(op, msg, { keepSel = true } = {}) {
 }
 const deleteNative = (key) => { const n = S.nmap.get(key); return n ? nativeOp({ type: 'del', id: n.id, page: n.page }, '注釈を削除中…', { keepSel: false }) : null; };
 const moveNative = (n, dx, dy) => nativeOp({ type: 'move', id: n.id, page: n.page, dx, dy }, '注釈を移動中…');
+const vertsNative = (n, pts, dup) => nativeOp({ type: 'verts', id: n.id, page: n.page, pts, dup }, '頂点を変更中…');
 const resizeNative = (n, rect) => nativeOp({ type: 'resize', id: n.id, page: n.page, old: n.rect, rect }, '注釈のサイズを変更中…');
 async function editNativeContents(key) {
   const n = S.nmap.get(key); if (!n || S.busy) return;
@@ -2131,18 +2317,28 @@ pagesEl.addEventListener('pointerdown', (e) => {
     if (ghEl && p && p.view) { startGroupScale(e, p, +ghEl.dataset.gh); return; }
     const hEl = e.target.closest && e.target.closest('[data-h]');
     const nhEl = e.target.closest && e.target.closest('[data-nh]');
+    const nvEl = e.target.closest && e.target.closest('[data-nv]');
     const aEl = e.target.closest && e.target.closest('[data-id]');
     const nEl = e.target.closest && e.target.closest('[data-nid]');
     if (hEl) {
       const a = S.annots.find((x) => x.id === hEl.dataset.id); if (!a) return;
       const idx = +hEl.dataset.h;
-      if (e.altKey && isMulti(a.type) && a.pts.length > (a.type === 'cloud' ? 3 : 2)) {
+      if (e.altKey && isMulti(a.type) && a.pts.length > minPts(a.type)) {
         const snap = takeSnap(); a.pts.splice(idx, 1); redrawPage(pageOf(a)); commit(snap); e.preventDefault(); return;
       }
       const bb = isRectLike(a) ? localBox(a) : annotBBox(a), hp = handlePoints(a);
       S.drag = { mode: 'handle', a, idx, snap: takeSnap(), p: pageOf(a), ar: (bb[2] - bb[0]) / Math.max(bb[3] - bb[1], 1e-6),
         O: isRectLike(a) || a.type === 'ink' ? hp[(idx + 2) % 4].slice() : null, H: hp[idx].slice(), origA: clone(a) };
       e.preventDefault();
+    } else if (nvEl) {
+      const n = S.nmap.get(nvEl.dataset.nid), np = n && nativePts(n); if (!np) return;
+      const idx = +nvEl.dataset.nv;
+      e.preventDefault();
+      if (e.altKey) {          // Alt+クリック: 頂点を削除（直線は2点のまま）
+        if (n.subtype !== 'Line' && np.pts.length > nativeMinPts(n)) { np.pts.splice(idx, 1); vertsNative(n, np.pts, np.dup); }
+        return;
+      }
+      S.drag = { mode: 'nvert', n, p: pageOf(n), idx, pts: np.pts, dup: np.dup, moved: false };
     } else if (nhEl) {
       const n = S.nmap.get(nhEl.dataset.nid); if (!n) return;
       const pg = pageOf(n), i = +nhEl.dataset.nh, [x0, y0, x1, y1] = vbox(pg.view, n.rect);
@@ -2240,6 +2436,13 @@ window.addEventListener('pointermove', (e) => {
       if (e.shiftKey) { if (Math.abs(d.d[0]) > Math.abs(d.d[1])) d.d[1] = 0; else d.d[0] = 0; }
       if (Math.hypot(d.d[0], d.d[1]) * p.view.scale > 3) d.moved = true;
       if (d.moved) redrawPage(p);
+    } else if (d.mode === 'nvert') {
+      let c = xy;
+      if (e.shiftKey) {        // Shift: 隣の頂点から45°刻み
+        const m = d.pts.length, nb = d.idx > 0 ? d.idx - 1 : (d.n.subtype === 'Polygon' ? m - 1 : 1);
+        c = snap45(toVp(p, d.pts[nb]), xy);
+      }
+      d.pts[d.idx] = toPdf(p, c); d.moved = true; redrawPage(p);
     } else if (d.mode === 'nresize') {
       const O = d.O; let dx = xy[0] - O[0], dy = xy[1] - O[1];
       if (d.lockAr !== e.shiftKey) {
@@ -2348,6 +2551,8 @@ window.addEventListener('pointerup', () => {
   } else if (d.mode === 'amarq') { finishMarquee(d);
   } else if (d.mode === 'nmove') {
     if (d.moved) moveNative(d.n, d.d[0], d.d[1]); else if (d.toggle) toggleSel(d.toggle);
+  } else if (d.mode === 'nvert') {
+    if (d.moved) vertsNative(d.n, d.pts, d.dup); else redrawPage(d.p);
   } else if (d.mode === 'nresize') {
     const [a0, b0, a1, b1] = d.vr, A = toPdf(d.p, [a0, b0]), B = toPdf(d.p, [a1, b1]);
     const rect = [Math.min(A[0], B[0]), Math.min(A[1], B[1]), Math.max(A[0], B[0]), Math.max(A[1], B[1])];
@@ -2395,7 +2600,7 @@ function finishPoly() {
   S.draft = null;
   const pts = dr.pts.slice(0, -1);
   const ded = pts.filter((q, i) => i === 0 || Math.hypot(q[0] - pts[i - 1][0], q[1] - pts[i - 1][1]) > 0.5);
-  if (ded.length < (dr.type === 'cloud' ? 3 : 2)) { redrawPage(S.pages[dr.page - 1]); return; }
+  if (ded.length < minPts(dr.type)) { redrawPage(S.pages[dr.page - 1]); return; }
   dr.pts = ded; addAnnot(dr);
 }
 function cancelDraft() { if (!S.draft) return; const p = S.pages[S.draft.page - 1]; S.draft = null; S.drag = null; redrawPage(p); }
@@ -2439,12 +2644,27 @@ function endEdit(commitIt = true) {
 pagesEl.addEventListener('dblclick', (e) => {
   if (!isSelTool() || S.busy) return;
   const nEl = e.target.closest && e.target.closest('[data-nid]');
-  if (nEl && !e.target.closest('[data-nh]')) { editNativeContents(nEl.dataset.nid); return; }
+  if (nEl && !e.target.closest('[data-nh]')) {
+    const n = S.nmap.get(nEl.dataset.nid), np = n && n.subtype !== 'Line' ? nativePts(n) : null;
+    if (np) {               // 既存の折れ線・多角形・雲形: 辺をダブルクリックすると頂点を追加（コメントの編集は Enter／「コメントを編集」）
+      const p = pageOf(n), xy = evXY(e, p), m = np.pts.length, nSeg = n.subtype === 'Polygon' ? m : m - 1;
+      let best = -1, bd = Infinity, bq = null;
+      for (let i = 0; i < nSeg; i++) {
+        const A = toVp(p, np.pts[i]), B = toVp(p, np.pts[(i + 1) % m]);
+        const ab = [B[0] - A[0], B[1] - A[1]], l2 = ab[0] ** 2 + ab[1] ** 2 || 1;
+        const t = clamp(((xy[0] - A[0]) * ab[0] + (xy[1] - A[1]) * ab[1]) / l2, 0, 1);
+        const q = [A[0] + ab[0] * t, A[1] + ab[1] * t], dist = Math.hypot(q[0] - xy[0], q[1] - xy[1]);
+        if (dist < bd) { bd = dist; best = i; bq = q; }
+      }
+      if (best >= 0 && bd < 14) { np.pts.splice(best + 1, 0, toPdf(p, bq)); vertsNative(n, np.pts, np.dup); return; }
+    }
+    editNativeContents(nEl.dataset.nid); return;
+  }
   const a = selAnnot(); if (!a) return;
   if (a.type === 'text') { if (e.target.closest && e.target.closest('[data-id]')) beginEdit(a, false); return; }
   if (!isMulti(a.type)) return;
   const aEl = e.target.closest && e.target.closest('[data-id]'); if (!aEl || e.target.closest('[data-h]')) return;
-  const p = pageOf(a), xy = evXY(e, p), nPt = a.pts.length, nSeg = a.type === 'cloud' ? nPt : nPt - 1;
+  const p = pageOf(a), xy = evXY(e, p), nPt = a.pts.length, nSeg = isClosedT(a.type) ? nPt : nPt - 1;
   let best = -1, bd = Infinity, bq = null;
   for (let i = 0; i < nSeg; i++) {
     const A = toVp(p, a.pts[i]), B = toVp(p, a.pts[(i + 1) % nPt]);
@@ -3214,7 +3434,7 @@ window.addEventListener('keydown', (e) => {
   const tag = (e.target.tagName || '').toLowerCase();
   const typing = (tag === 'input' && !['checkbox', 'range', 'color'].includes(e.target.type)) || tag === 'textarea' || tag === 'select';
   const mod = e.ctrlKey || e.metaKey;
-  if (mod && e.key.toLowerCase() === 's') { e.preventDefault(); save(e.shiftKey); return; }
+  if (mod && e.key.toLowerCase() === 's') { e.preventDefault(); if (!e.repeat) save(e.shiftKey); return; }   // 押し続けても1回だけ
   if (mod && e.key.toLowerCase() === 'o') { e.preventDefault(); openFileDialog(); return; }
   if (mod && e.key.toLowerCase() === 'p') { e.preventDefault(); printDoc(); return; }
   if (typing) return;
@@ -3248,7 +3468,7 @@ window.addEventListener('keydown', (e) => {
   if (S.paged && S.pdf && (e.key === 'PageDown' || e.key === 'PageUp')) { e.preventDefault(); pagedStep(e.key === 'PageDown' ? 1 : -1, true); return; }
   const k = e.key.toLowerCase();
   if (k === 'v') setTool('select'); else if (k === 'g') setTool('edit'); else if (k === 'a') setTool('asel'); else if (k === 'l') setTool('line'); else if (k === 'r') setTool('rect'); else if (k === 'e') setTool('ellipse');
-  else if (k === 'p') setTool('polyline'); else if (k === 'c') setTool('cloud'); else if (k === 't') { e.preventDefault(); setTool('text'); }
+  else if (k === 'p') setTool('polyline'); else if (k === 'n') setTool('polygon'); else if (k === 'c') setTool('cloud'); else if (k === 't') { e.preventDefault(); setTool('text'); }
   const a = selAnnot(), nat = selNative();
   if (a && a.type === 'text' && e.key === 'Enter') { e.preventDefault(); beginEdit(a, false); return; }
   if (nat && e.key === 'Enter') { e.preventDefault(); editNativeContents(nat.key); return; }
@@ -3298,6 +3518,7 @@ async function ensureWrite(h) {
   } catch { return false; }
 }
 async function writeHandle(h, bytes) {
+  assertPdfBytes(bytes);
   const w = await h.createWritable();
   try { await w.write(new Blob([bytes], { type: 'application/pdf' })); await w.close(); }
   catch (e) { try { await w.abort(); } catch { /* ignore */ } throw e; }
@@ -3337,9 +3558,50 @@ async function downloadBytes(bytes, filename, { saveAs = false } = {}) {
 function showError(title, e) {
   const msg = friendlyError(e), raw = (e && (e.stack || e.message)) || String(e);
   return dialog({ title, ok: 'OK',
-    html: `<p style="white-space:pre-wrap">${esc(msg)}</p><details open><summary>詳細（開発者への連絡用）</summary><textarea readonly rows="6" style="width:480px;max-width:80vw">${esc(`${e && e.name ? e.name + ': ' : ''}${(e && e.message) || ''}\n${raw}\nv4.8 / ${navigator.userAgent}`)}</textarea></details>` });
+    html: `<p style="white-space:pre-wrap">${esc(msg)}</p><details open><summary>詳細（開発者への連絡用）</summary><textarea readonly rows="6" style="width:480px;max-width:80vw">${esc(`${e && e.name ? e.name + ': ' : ''}${(e && e.message) || ''}\n${raw}\nv4.10 / ${navigator.userAgent}`)}</textarea></details>` });
 }
 // 保存（上書き／名前を付けて保存）。可能ならファイルに直接書き込み、できなければダウンロードにする
+// file:// のURL → PCのパス（Windows: C:\...、共有フォルダ: \\サーバー\...、それ以外: /...）
+function fileUrlToPath(u) {
+  try {
+    const x = new URL(u); if (x.protocol !== 'file:') return '';
+    const p = decodeURIComponent(x.pathname);
+    if (x.host && x.host !== 'localhost') return '\\\\' + x.host + p.replace(/\//g, '\\');
+    if (/^\/[A-Za-z]:/.test(p)) return p.slice(1).replace(/\//g, '\\');
+    return p;
+  } catch { return ''; }
+}
+// 元のPDFの場所を選んでもらう保存先の選択画面。ブラウザーは、選択画面のファイル名欄にフォルダーのパスを入れることを許さない
+// （「\」「:」が「_」に置き換えられる）ため、元のPDFのフルパスをクリップボードにコピーし、ファイル名欄で Ctrl+V で貼り付けてもらう。
+// 拡張子（.pdf）はコピーしない: ファイル名欄で選択されているのが名前の部分だけでも、全体でも、貼り付けると正しいパスになる（.pdf は画面が補う）
+// 保存先の選択画面を開く。戻り値 { h } または { e }（キャンセルは AbortError）。
+// 注意: ブラウザーは、選択画面で既存のファイルを選んだ時点で、そのファイルを0バイトに切り詰める。
+//       そのため、この画面は「保存用のPDFを作り終えてから」開く（作成に失敗したとき、元のファイルを空にしないため）。
+// toOriginal: ダブルクリックで開いたPDFの最初の［保存］。元のPDFのフルパスをコピーし、ファイル名欄に Ctrl+V で貼り付けてもらう
+//   （ブラウザーは、ファイル名欄にフォルダーのパスを入れることを許さない。「\」「:」が「_」に置き換えられる）。
+//   拡張子（.pdf）はコピーしない: ファイル名欄で選択されているのが名前の部分だけでも、全体でも、正しいパスになる（.pdf は画面が補う）
+async function pickSaveTarget(suggestedName, toOriginal) {
+  if (toOriginal) {
+    const path = fileUrlToPath(S.sourceUrl);
+    if (path) {
+      try {
+        await navigator.clipboard.writeText(path.replace(/\.pdf$/i, ''));
+        toast(`元のPDFに上書きするには、保存画面のファイル名欄で Ctrl+V を押して［保存］→［はい］。（元のPDFの場所をコピーしました: ${path}）`, 30000);
+      } catch { toast(`元のPDFに上書きするには、保存画面で次の場所を選んでください: ${path}`, 30000); }
+    }
+  }
+  // PDFの作成に時間がかかり、ボタンを押した直後の操作と見なされなくなったときは、もう一度ボタンを押してもらう（ブラウザーの決まり）
+  if (navigator.userActivation && !navigator.userActivation.isActive) {
+    const ok = await dialog({ title: '保存先を選ぶ', ok: '保存先を選ぶ', html: '<p>保存用のPDFができました。［保存先を選ぶ］を押して、保存先を選んでください。</p>' });
+    if (!ok) return { e: new DOMException('キャンセルしました', 'AbortError') };
+  }
+  return window.showSaveFilePicker({ suggestedName, id: 'epa-pdf', types: PDF_PICKER_TYPES }).then((h) => ({ h }), (e) => ({ e }));
+}
+// 書き込む前の確認: 中身がPDFとして正しくなければ、どのファイルにも書き込まない（空のファイルで上書きしないため）
+function assertPdfBytes(bytes) {
+  const ok = bytes && bytes.length > 64 && bytes[0] === 0x25 && bytes[1] === 0x50 && bytes[2] === 0x44 && bytes[3] === 0x46;   // %PDF
+  if (!ok) throw new Error(`保存用のPDFを正しく作れませんでした（${bytes ? bytes.length : 0}バイト）。元のファイルは変更していません。`);
+}
 // 戻り値: 保存できたら true（キャンセル・失敗は false）
 async function save(saveAs = false) {
   if (!S.pdf || S.busy) return false;
@@ -3347,24 +3609,29 @@ async function save(saveAs = false) {
   const base = S.fileName.replace(/\.pdf$/i, '');
   let step = '準備';
   try {
-    const pick = saveAs && window.showSaveFilePicker
-      ? window.showSaveFilePicker({ suggestedName: `${base}.pdf`, id: 'epa-pdf', types: PDF_PICKER_TYPES }).then((h) => ({ h }), (e) => ({ e })) : null;
     let handle = null;
     if (!saveAs) {
       handle = S.fileHandle || (await restoreHandle());
       if (handle && !(await ensureWrite(handle))) handle = null;
     }
+    // ダブルクリックで開いたPDF（file://）で、上書き先がまだ分からないとき: 保存先の選択画面で、元のPDFの場所を選んでもらう
+    const toOriginal = !saveAs && !handle && !!window.showSaveFilePicker && !!S.sourceUrl && /^file:/i.test(S.sourceUrl);
+    const pickIt = (saveAs && !!window.showSaveFilePicker) || toOriginal;
+    // ① 先に保存用のPDFを作る。失敗したら、保存先のファイルには一切触れずに終える
     setBusy(true, '保存用PDFを作成中…'); step = 'PDFの作成';
     const bytes = await buildPdfBytes();
+    assertPdfBytes(bytes);
     let msg;
-    if (saveAs) {
-      const r = pick ? await pick : null;
+    if (saveAs || toOriginal) {
+      // ② できてから、保存先を選んでもらう
+      setBusy(false); step = '保存先の選択';
+      const r = pickIt ? await pickSaveTarget(saveAs ? `${base}.pdf` : (urlFileName(S.sourceUrl) || pdfName(S.fileName)), toOriginal) : null;
       if (r && r.e && r.e.name === 'AbortError') { toast('保存をキャンセルしました'); return false; }
       if (r && r.h) {
         step = 'ファイルへの書き込み'; setBusy(true, 'ファイルに書き込み中…');
         await writeHandle(r.h, bytes);
         S.fileHandle = r.h; S.fileName = r.h.name; $('#fileName').textContent = r.h.name; document.title = `${r.h.name} - PDFエディター`;
-        await rememberHandle(r.h); msg = `保存しました: ${r.h.name}`;
+        await rememberHandle(r.h); msg = `保存しました: ${r.h.name}`;            // 次からは、このファイルに直接上書きする
       } else {
         step = '名前を付けて保存（ダウンロード）'; setBusy(false);
         const path = await downloadBytes(bytes, pdfName(base), { saveAs: true });
