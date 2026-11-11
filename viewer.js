@@ -1,7 +1,7 @@
 import * as pdfjsLib from './lib/pdf.min.mjs';
 import { createContentEditor } from './pdfedit.js';
 import { createPdfUnlocker } from './pdfcrypt.js';
-/* ローカルPDFエディター v4.10 — ビューア本体（viewer.html から読み込まれる）
+/* ローカルPDFエディター v4.11 — ビューア本体（viewer.html から読み込まれる）
  *
  * 使っているライブラリ（すべて lib/ に同梱。インターネットには接続しない）
  *   - PDF.js  : 表示・文字の選択・暗号化PDFの読み込み（lib/pdf.min.mjs は2か所だけ改変: 細線の最小線幅、タイリングパターンのキャッシュ。lib/PATCH-NOTE.txt）
@@ -24,6 +24,9 @@ import { createPdfUnlocker } from './pdfcrypt.js';
 const MARKER = 'EdgePDFShapes';
 const LIB = new URL('./lib/', import.meta.url).href;
 pdfjsLib.GlobalWorkerOptions.workerSrc = LIB + 'pdf.worker.min.mjs';
+// v4.11.1: PDF.js の作業スレッドは、起動時に1つだけ作り、すべての文書で使い回す
+// （PDFファイルを読んでいる間に作業スレッドの準備が済む。編集のたびの読み直しでも、変換済みのフォントなどが再利用されて速い）
+const PDFW = new pdfjsLib.PDFWorker();
 const { PDFDocument, PDFName, PDFString, PDFHexString, PDFDict, PDFArray, PDFStream, PDFRef, degrees, StandardFonts } = window.PDFLib;
 const CE = createContentEditor(window.PDFLib);
 const UNLOCK = createPdfUnlocker(window.PDFLib);
@@ -36,7 +39,7 @@ const LS = {
 };
 /* ---------------------------------------------------------------- state */
 const DEFAULTS = { start: 'None', end: 'None', style: 'solid', width: 1, color: '#e03a2a', fill: null, opacity: 100, intensity: 1, radius: 0, startSize: 100, endSize: 100 };
-const TEXT_DEFAULTS = { start: 'None', end: 'None', style: 'solid', width: 0, color: '#000000', fill: null, opacity: 100, fontSize: 12, intensity: 1 };
+const TEXT_DEFAULTS = { start: 'None', end: 'None', style: 'solid', width: 0, color: '#000000', fill: null, opacity: 100, fontSize: 12, face: 'gothic', intensity: 1 };
 const savedZoom = LS.get('zoom', { fit: 'width', scale: 1.25 });
 const S = {
   pdf: null, baseBytes: null, fileName: 'document.pdf', fileHandle: null, sourceUrl: null,
@@ -47,7 +50,7 @@ const S = {
   textMode: LS.get('textMode', 'outline'),
   gamma: LS.get('gamma', 100),
   aa: LS.get('aa', 'auto'),
-  libErr: null, zooming: false,
+  libErr: null, zooming: false, lock: { enc: false, annot: true, print: true }, outline: [], bmSel: null,
   cur: 1, want: 1, keep: new Set(), dirNav: 1,
   pages: [], firstView1: null, loadGen: 0,
   annots: [], natives: [], nmap: new Map(), images: new Map(),
@@ -56,6 +59,7 @@ const S = {
   editing: null, busy: false, author: LS.get('author', ''),
 };
 globalThis.__EPA_MINW = 0;
+globalThis.__epaMeshId = 0;                 // pdf.min.mjs の改変（メッシュのグラデーションの使い回し）で使う番号
 window.__EPA = S;
 /* 注釈の選択（v3.1: 複数選択）。S.sel に選択中のキー（自前の注釈id / 既存注釈 'n:…'）。S.selId は1つだけ選択しているときのキー */
 S.sel = new Set();
@@ -109,7 +113,6 @@ const vunit = (a) => { const l = vlen(a) || 1; return [a[0] / l, a[1] / l]; };
 const clone = (o) => JSON.parse(JSON.stringify(o));
 const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 const normRot = (r) => (((Math.round((r || 0) / 90) * 90) % 360) + 360) % 360;
-const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 let toastTimer;
 function toast(msg, ms = 2600) {
   const t = $('#toast'); t.textContent = msg; t.classList.add('show');
@@ -211,7 +214,7 @@ function ellipsePath(p0, p1) {
 const rotPt = (q, c, deg) => { if (!deg) return [q[0], q[1]]; const t = deg * Math.PI / 180, cs = Math.cos(t), sn = Math.sin(t), dx = q[0] - c[0], dy = q[1] - c[1]; return [c[0] + dx * cs - dy * sn, c[1] + dx * sn + dy * cs]; };
 const normDeg = (d) => { let v = ((d % 360) + 360) % 360; if (v > 180) v -= 360; return Math.abs(v) < 1e-6 ? 0 : v; };
 function localBox(a) {
-  if (a.type === 'text') { const L = layoutText(a.text, a.p.fontSize, a.w); return [a.pts[0][0], a.pts[0][1] - L.h, a.pts[0][0] + a.w, a.pts[0][1]]; }
+  if (a.type === 'text') { const L = layoutText(a.text, a.p.fontSize, a.w, { face: a.p.face }); return [a.pts[0][0], a.pts[0][1] - L.h, a.pts[0][0] + a.w, a.pts[0][1]]; }
   const [p0, p1] = a.pts;
   return [Math.min(p0[0], p1[0]), Math.min(p0[1], p1[1]), Math.max(p0[0], p1[0]), Math.max(p0[1], p1[1])];
 }
@@ -329,64 +332,72 @@ function primsBBox(prims) {
 }
 /* ------------------------------------------------------- テキストのレイアウト（保存する実テキストと同じ字幅で改行） */
 const FONT_LAT = 'Helvetica, Arial, "Liberation Sans", sans-serif';
-const FONT_JP = '"MS Gothic","Yu Gothic","Meiryo","Hiragino Sans","Noto Sans CJK JP",sans-serif';
+const FONT_MINCHO_JP = '"Yu Mincho","YuMincho","MS Mincho","Hiragino Mincho ProN","Noto Serif CJK JP",serif';
 const FONT_STACK = `Helvetica, Arial, "Liberation Sans", "MS Gothic", "Yu Gothic", "Meiryo", "Noto Sans CJK JP", sans-serif`;
 const SCRATCH = await PDFDocument.create();
 const HELV = SCRATCH.embedStandardFont(StandardFonts.Helvetica);
+// テキスト注釈の書体（v4.11）。欧文は標準14フォント、和文は埋め込まないフォント（閲覧する側の明朝・ゴシックで表示される）
+//  lat/jp: PDF内のフォント名（外観ストリームと /DA で使う）、std: 欧文の字幅の計算用、css: 画面表示用
+const FACES = {
+  gothic: { label: 'ゴシック', lat: 'Helv', jp: 'EPAJp', std: HELV, css: { l: FONT_LAT, j: '"MS Gothic","Yu Gothic","Meiryo","Hiragino Sans","Noto Sans CJK JP",sans-serif' } },
+  mincho: { label: '明朝', lat: 'TiRo', jp: 'EPAJpM', std: SCRATCH.embedStandardFont(StandardFonts.TimesRoman), css: { l: '"Times New Roman",Times,"Liberation Serif",serif', j: FONT_MINCHO_JP } },
+  mono: { label: '等幅', lat: 'Cour', jp: 'EPAJp', std: SCRATCH.embedStandardFont(StandardFonts.Courier), css: { l: '"Courier New",Courier,"Liberation Mono",monospace', j: '"MS Gothic","Noto Sans Mono CJK JP","Noto Sans CJK JP",monospace' } },
+};
+const faceOf = (f) => FACES[f] || FACES.gothic;
 const latCache = new Map();
-function latW1(ch) {
-  let w = latCache.get(ch);
-  if (w === undefined) { try { w = HELV.widthOfTextAtSize(ch, 1000) / 1000; } catch { w = 0.556; } latCache.set(ch, w); }
+function latW1(ch, face = 'gothic') {
+  const k = face + ch; let w = latCache.get(k);
+  if (w === undefined) { try { w = faceOf(face).std.widthOfTextAtSize(ch, 1000) / 1000; } catch { w = 0.556; } latCache.set(k, w); }
   return w;
 }
 const isLat = (c) => (c >= 0x20 && c <= 0x7e) || (c >= 0xa0 && c <= 0xff);
 const isHW = (c) => c >= 0xff61 && c <= 0xff9f;
-const chW = (ch, fs) => { const c = ch.codePointAt(0); return isLat(c) ? latW1(ch) * fs : isHW(c) ? fs * 0.5 : fs; };
-const strW = (s, fs) => { let w = 0; for (const ch of s) w += chW(ch, fs); return w; };
-function wrapPara(para, fs, maxW) {
+const chW = (ch, fs, face) => { const c = ch.codePointAt(0); return isLat(c) ? latW1(ch, face) * fs : isHW(c) ? fs * 0.5 : fs; };
+const strW = (s, fs, face) => { let w = 0; for (const ch of s) w += chW(ch, fs, face); return w; };
+function wrapPara(para, fs, maxW, face) {
   const out = []; let cur = '', cw = 0;
   const toks = para.match(/[\x21-\x7e\xa1-\xff]+|[\s\S]/gu) || [];
   for (const t of toks) {
-    const tw = strW(t, fs);
+    const tw = strW(t, fs, face);
     if (cw + tw <= maxW) { cur += t; cw += tw; continue; }
     if (/^\s$/.test(t)) { out.push(cur.replace(/\s+$/, '')); cur = ''; cw = 0; continue; }
     if (cur !== '') { out.push(cur.replace(/\s+$/, '')); cur = ''; cw = 0; }
     if (tw <= maxW) { cur = t; cw = tw; continue; }
-    for (const ch of t) { const w = chW(ch, fs); if (cw + w > maxW && cur !== '') { out.push(cur); cur = ''; cw = 0; } cur += ch; cw += w; }
+    for (const ch of t) { const w = chW(ch, fs, face); if (cw + w > maxW && cur !== '') { out.push(cur); cur = ''; cw = 0; } cur += ch; cw += w; }
   }
   out.push(cur.replace(/\s+$/, ''));
   return out;
 }
-function toRuns(line, fs) {
+function toRuns(line, fs, face) {
   const runs = []; let x = 0, cur = null;
   for (const ch of line) {
-    const c = ch.codePointAt(0), f = isLat(c) ? 'l' : 'j', w = chW(ch, fs);
+    const c = ch.codePointAt(0), f = isLat(c) ? 'l' : 'j', w = chW(ch, fs, face);
     if (cur && cur.f === f) { cur.t += ch; cur.w += w; } else { cur = { t: ch, f, x, w }; runs.push(cur); }
     x += w;
   }
   return { runs, w: x };
 }
 function layoutText(text, fs, w, o = {}) {
-  const pad = o.pad ?? 2, q = o.q || 0;
+  const pad = o.pad ?? 2, q = o.q || 0, face = o.face || 'gothic';
   const maxW = Math.max(fs, w - pad * 2);
   const lines = [];
   for (const para of String(text || '').replace(/\t/g, '    ').split(/\r\n|\r|\n/)) {
-    for (const ln of (para === '' ? [''] : wrapPara(para, fs, maxW))) {
-      const r = toRuns(ln, fs);
+    for (const ln of (para === '' ? [''] : wrapPara(para, fs, maxW, face))) {
+      const r = toRuns(ln, fs, face);
       const dx = pad + (q === 1 ? (maxW - r.w) / 2 : q === 2 ? maxW - r.w : 0);
       r.runs.forEach((u) => { u.x += dx; });
       lines.push(r);
     }
   }
   const lh = fs * 1.25, b = (lh - fs) / 2 + fs * 0.86;
-  return { lines, lh, b, pad, w, h: Math.max(lines.length, 1) * lh + pad * 2,
+  return { lines, lh, b, pad, w, h: Math.max(lines.length, 1) * lh + pad * 2, maxLineW: Math.max(0, ...lines.map((l) => l.w)),
     hasJp: lines.some((l) => l.runs.some((r) => r.f === 'j' && r.t.trim() !== '')) };
 }
 function annotBBox(a) {
   if (a.rot && (a.type === 'rect' || a.type === 'ellipse')) return primsBBox(shapePrims(a));
   if (a.rot && (a.type === 'text' || a.type === 'stamp')) { const q = annotQuad(a); return [Math.min(...q.map((v) => v[0])), Math.min(...q.map((v) => v[1])), Math.max(...q.map((v) => v[0])), Math.max(...q.map((v) => v[1]))]; }
   if (a.type === 'text') {
-    const L = layoutText(a.text, a.p.fontSize, a.w);
+    const L = layoutText(a.text, a.p.fontSize, a.w, { face: a.p.face });
     return [a.pts[0][0], a.pts[0][1] - L.h, a.pts[0][0] + a.w, a.pts[0][1]];
   }
   if (a.type === 'stamp' || a.type === 'rect' || a.type === 'ellipse') {
@@ -439,7 +450,19 @@ function fontRefs(doc) {
     FontDescriptor: desc, DW: 1000, W: [231, 632, 500] }));
   const jp = ctx.register(ctx.obj({ Type: 'Font', Subtype: 'Type0', BaseFont: 'MS-Gothic-UniJIS-UTF16-H',
     Encoding: 'UniJIS-UTF16-H', DescendantFonts: [cid] }));
-  r = { helv: helv.ref, jp }; FONTMAP.set(doc, r); return r;
+  r = { helv: helv.ref, jp }; FONTMAP.set(doc, r);
+  // 明朝・等幅の書体（使うときだけ作る）
+  r.more = () => {
+    if (r.all) return r.all;
+    const descM = ctx.register(ctx.obj({ Type: 'FontDescriptor', FontName: 'MS-Mincho', Flags: 6, FontBBox: [0, -137, 1000, 859],
+      ItalicAngle: 0, Ascent: 859, Descent: -140, CapHeight: 709, StemV: 80 }));
+    const cidM = ctx.register(ctx.obj({ Type: 'Font', Subtype: 'CIDFontType2', BaseFont: 'MS-Mincho',
+      CIDSystemInfo: { Registry: PDFString.of('Adobe'), Ordering: PDFString.of('Japan1'), Supplement: 6 }, FontDescriptor: descM, DW: 1000, W: [231, 632, 500] }));
+    const jpM = ctx.register(ctx.obj({ Type: 'Font', Subtype: 'Type0', BaseFont: 'MS-Mincho-UniJIS-UTF16-H', Encoding: 'UniJIS-UTF16-H', DescendantFonts: [cidM] }));
+    r.all = { Helv: r.helv, EPAJp: r.jp, EPAJpM: jpM, TiRo: doc.embedStandardFont(StandardFonts.TimesRoman).ref, Cour: doc.embedStandardFont(StandardFonts.Courier).ref };
+    return r.all;
+  };
+  return r;
 }
 function ensureDR(doc) {
   const refs = fontRefs(doc), ctx = doc.context, root = doc.catalog, N = (k) => PDFName.of(k);
@@ -451,6 +474,7 @@ function ensureDR(doc) {
   if (!(fd instanceof PDFDict)) { fd = ctx.obj({}); dr.set(N('Font'), fd); }
   if (!fd.has(N('Helv'))) fd.set(N('Helv'), refs.helv);
   if (!fd.has(N('EPAJp'))) fd.set(N('EPAJp'), refs.jp);
+  if (refs.all) for (const [k, v] of Object.entries(refs.all)) if (!fd.has(N(k))) fd.set(N(k), v);
 }
 const hexLat = (s) => [...s].map((ch) => ch.codePointAt(0).toString(16).padStart(2, '0')).join('');
 const hexU16 = (s) => { let o = ''; for (let i = 0; i < s.length; i++) o += s.charCodeAt(i).toString(16).padStart(4, '0'); return o; };
@@ -459,8 +483,9 @@ const rotMatrix = (r) => [...ROTM[normRot(r)], 0, 0];
 // スタンプの画像が正立するページの回転（貼ったときの回転。古いデータで不明なら pageRot）
 const stampRot = (a, pageRot) => (a.prot === undefined || a.prot === null ? normRot(pageRot) : normRot(a.prot));
 function buildTextAP(doc, s) {
-  const ctx = doc.context, refs = fontRefs(doc);
-  const L = layoutText(s.text, s.fs, s.w, { q: s.q || 0, pad: s.pad ?? 2 });
+  const ctx = doc.context, refs = fontRefs(doc), F = faceOf(s.face);
+  const fonts = !s.face || s.face === 'gothic' ? { Helv: refs.helv, EPAJp: refs.jp } : refs.more();
+  const L = layoutText(s.text, s.fs, s.w, { q: s.q || 0, pad: s.pad ?? 2, face: s.face });
   const ops = ['/GS0 gs', 'q', `0 0 ${n3(s.w)} ${n3(s.h)} re W n`];
   if (s.fill) ops.push(`${s.fill.map(n3).join(' ')} rg 0 0 ${n3(s.w)} ${n3(s.h)} re f`);
   if (s.bw > 0) ops.push(`${s.bcolor.map(n3).join(' ')} RG ${n3(s.bw)} w ${n3(s.bw / 2)} ${n3(s.bw / 2)} ${n3(s.w - s.bw)} ${n3(s.h - s.bw)} re S`);
@@ -469,16 +494,16 @@ function buildTextAP(doc, s) {
     const y = s.h - L.pad - i * L.lh - L.b;
     for (const r of ln.runs) {
       if (r.t.trim() === '') continue;
-      ops.push(`BT /${r.f === 'l' ? 'Helv' : 'EPAJp'} ${n3(s.fs)} Tf ${n3(r.x)} ${n3(y)} Td <${r.f === 'l' ? hexLat(r.t) : hexU16(r.t)}> Tj ET`);
+      ops.push(`BT /${r.f === 'l' ? F.lat : F.jp} ${n3(s.fs)} Tf ${n3(r.x)} ${n3(y)} Td <${r.f === 'l' ? hexLat(r.t) : hexU16(r.t)}> Tj ET`);
     }
   });
   ops.push('Q');
   const op = s.opacity ?? 1;
   const dict = { Type: 'XObject', Subtype: 'Form', BBox: [0, 0, s.w, s.h],
-    Resources: { ExtGState: { GS0: { Type: 'ExtGState', CA: op, ca: op } }, Font: { Helv: refs.helv, EPAJp: refs.jp } } };
+    Resources: { ExtGState: { GS0: { Type: 'ExtGState', CA: op, ca: op } }, Font: fonts } };
   if (s.rot) dict.Matrix = rotMatrix(s.rot);
   if (s.mat) dict.Matrix = s.mat;
-  return { ref: ctx.register(ctx.stream(ops.join('\n'), dict)), hasJp: L.hasJp };
+  return { ref: ctx.register(ctx.stream(ops.join('\n'), dict)), hasJp: L.hasJp, daFont: L.hasJp ? F.jp : F.lat };
 }
 const daString = (font, fs, rgb) => `/${font} ${n3(fs)} Tf ${rgb.map(n3).join(' ')} rg`;
 function parseDA(da) {
@@ -502,18 +527,18 @@ async function addAnnotToPage(doc, page, a, cache) {
   const base = { Type: 'Annot', F: 4, NM: PDFString.of(a.id), M: PDFString.of(pdfDate()), P: page.ref, EPAType: a.type, CA: op };
   if (a.author) base.T = PDFHexString.fromText(a.author);
   if (a.date) base.CreationDate = PDFString.of(pdfDate());
-  base.EPAGeom = PDFHexString.fromText(JSON.stringify({ pts: a.pts, w: a.w ?? null, rot: a.rot || 0, prot: a.prot ?? null, radius: a.p.radius || 0, ends: [a.p.start, a.p.end], endSizes: [a.p.startSize ?? 100, a.p.endSize ?? 100] }));
+  base.EPAGeom = PDFHexString.fromText(JSON.stringify({ pts: a.pts, w: a.w ?? null, rot: a.rot || 0, prot: a.prot ?? null, face: a.p.face || null, autoW: a.autoW || null, radius: a.p.radius || 0, ends: [a.p.start, a.p.end], endSizes: [a.p.startSize ?? 100, a.p.endSize ?? 100] }));
   const rotM = a.rot ? (() => { const t = a.rot * Math.PI / 180; return [Math.cos(t), Math.sin(t), -Math.sin(t), Math.cos(t), 0, 0]; })() : null;
   let dict, R;
   if (a.type === 'text') {
     R = annotBBox(a);
     const lb = localBox(a);
     const rgb = hex2rgb(a.p.color), bw = a.p.width || 0;
-    const ap = buildTextAP(doc, { w: lb[2] - lb[0], h: lb[3] - lb[1], rot: 0, mat: rotM, text: a.text, fs: a.p.fontSize, rgb,
+    const ap = buildTextAP(doc, { w: lb[2] - lb[0], h: lb[3] - lb[1], rot: 0, mat: rotM, text: a.text, fs: a.p.fontSize, rgb, face: a.p.face,
       fill: a.p.fill ? hex2rgb(a.p.fill) : null, bw, bcolor: rgb, opacity: op, q: 0, pad: 2 });
     ensureDR(doc);
     dict = { ...base, Subtype: 'FreeText', Rect: R, Contents: PDFHexString.fromText(a.text),
-      DA: PDFString.of(daString(ap.hasJp ? 'EPAJp' : 'Helv', a.p.fontSize, rgb)), Q: 0,
+      DA: PDFString.of(daString(ap.daFont, a.p.fontSize, rgb)), Q: 0,
       BS: { Type: 'Border', W: bw, S: 'S' }, AP: { N: ap.ref } };
     if (bw > 0) dict.C = rgb;
     if (a.p.fill) dict.IC = hex2rgb(a.p.fill);
@@ -594,12 +619,12 @@ function rasterAnnot(a, k0 = 4) {
   c.setTransform(k, 0, 0, -k, -x0 * k, y1 * k);
   c.globalAlpha = (a.p.opacity ?? 100) / 100;
   if (a.type === 'text') {
-    const L = layoutText(a.text, a.p.fontSize, a.w), bw = a.p.width || 0;
+    const L = layoutText(a.text, a.p.fontSize, a.w, { face: a.p.face }), bw = a.p.width || 0, F = faceOf(a.p.face);
     c.save(); c.translate(a.pts[0][0], a.pts[0][1]); if (a.rot) c.rotate(a.rot * Math.PI / 180); c.scale(1, -1);
     if (a.p.fill) { c.fillStyle = a.p.fill; c.fillRect(0, 0, a.w, L.h); }
     if (bw > 0) { c.strokeStyle = a.p.color; c.lineWidth = bw; c.strokeRect(bw / 2, bw / 2, a.w - bw, L.h - bw); }
     c.fillStyle = a.p.color; c.textBaseline = 'alphabetic';
-    L.lines.forEach((ln, i) => { for (const r of ln.runs) { if (r.t.trim() === '') continue; c.font = `${a.p.fontSize}px ${r.f === 'l' ? FONT_LAT : FONT_JP}`; c.fillText(r.t, r.x, L.pad + i * L.lh + L.b); } });
+    L.lines.forEach((ln, i) => { for (const r of ln.runs) { if (r.t.trim() === '') continue; c.font = `${a.p.fontSize}px ${r.f === 'l' ? F.css.l : F.css.j}`; c.fillText(r.t, r.x, L.pad + i * L.lh + L.b); } });
     c.restore();
   } else {
     c.lineJoin = a.type === 'ink' || a.type === 'cloud' ? 'round' : 'miter';
@@ -661,12 +686,17 @@ async function buildPdfBytes() {
     catch (e2) { console.warn('PDF.js での保存も失敗', e2); throw e2.perm ? e2 : e; }
   }
 }
-// バイト列に文字列（ASCII）が含まれるか。先頭の1バイトは組み込みの indexOf で探すので、大きなPDFでも速い
-function bytesContain(bytes, str) {
-  const pat = new TextEncoder().encode(str), n = pat.length, last = bytes.length - n;
-  for (let i = bytes.indexOf(pat[0]); i >= 0 && i <= last; i = bytes.indexOf(pat[0], i + 1)) {
-    let j = 1; while (j < n && bytes[i + j] === pat[j]) j++;
-    if (j === n) return true;
+// バイト列に文字列（ASCII）のどれかが含まれるか。先頭の1バイトは組み込みの lastIndexOf で探すので、大きなPDFでも速い
+// （v4.11.1: 複数の文字列を1回の走査で探す。後ろから探す: このアドオンで保存したPDFは、注釈がファイルの後ろの方にあるので早く見つかる）
+function bytesContain(bytes, ...strs) {
+  const pats = strs.map((t) => new TextEncoder().encode(t)), c0 = pats[0][0];
+  if (pats.some((q) => q[0] !== c0)) return pats.some((q, k) => bytesContain(bytes, strs[k]));
+  for (let i = bytes.lastIndexOf(c0); i >= 0; i = i > 0 ? bytes.lastIndexOf(c0, i - 1) : -1) {
+    for (const q of pats) {
+      if (i + q.length > bytes.length) continue;
+      let j = 1; while (j < q.length && bytes[i + j] === q[j]) j++;
+      if (j === q.length) return true;
+    }
   }
   return false;
 }
@@ -749,6 +779,8 @@ async function extractOurs(bytes) {
           if (gm.rot) a.rot = gm.rot;
           if (type === 'stamp' && typeof gm.prot === 'number') a.prot = normRot(gm.prot);
           if (gm.radius) a.p.radius = gm.radius;
+          if (gm.face && FACES[gm.face]) a.p.face = gm.face;
+          if (gm.autoW) a.autoW = true;
           if (Array.isArray(gm.ends) && a.p.start !== undefined) { a.p.start = gm.ends[0] || 'None'; a.p.end = gm.ends[1] || 'None'; }
           if (Array.isArray(gm.endSizes)) { a.p.startSize = +gm.endSizes[0] || 100; a.p.endSize = +gm.endSizes[1] || 100; }
         } catch { /* ignore */ }
@@ -864,7 +896,7 @@ function ftxFillOf(s) {
   }
   return null;
 }
-function regenFreeText(doc, d) {
+function regenFreeText(doc, d, force = {}) {
   const ctx = doc.context, N = (k) => PDFName.of(k);
   const L = (o) => (o === undefined ? undefined : ctx.lookup(o));
   const nums = (o) => { const a = L(o); return a instanceof PDFArray ? a.asArray().map((x) => L(x).asNumber()) : null; };
@@ -882,13 +914,13 @@ function regenFreeText(doc, d) {
   const apD = L(d.get(N('AP'))), apN = apD instanceof PDFDict ? apD.get(N('N')) : null, apS = apN ? L(apN) : null;
   const apTxt = apS && apS.dict ? ftxApText(ctx, apN) : null;
   // ---- 文字の色: 実際に見えている色を優先（外観ストリーム → /RC → /DA）
-  let rgb = ftxApColor(apTxt) || ftxRcColor(str(d.get(N('RC')))) || da.rgb;
+  let rgb = force.rgb || ftxApColor(apTxt) || ftxRcColor(str(d.get(N('RC')))) || da.rgb;
   let dict = null, hasJp = false;
   // ---- ① 元の外観を残して、文字だけ入れ替える
   const bb = apS && apS.dict ? nums(apS.dict.get(N('BBox'))) : null;
   const mt = apS && apS.dict ? nums(apS.dict.get(N('Matrix'))) : null;
   const res = apS && apS.dict ? L(apS.dict.get(N('Resources'))) : null;
-  if (bb && bb.length === 4 && !rot && res instanceof PDFDict && w > 0 && h > 0) {
+  if (!force.rebuild && bb && bb.length === 4 && !rot && res instanceof PDFDict && w > 0 && h > 0) {
     const kept = ftxStripText(apTxt);
     if (kept !== null) {
       // 外観を注釈の枠（Rect）に合わせる変換（PDFの規格どおり）: 外観の座標 →（Matrix）→ BBoxをRectに合わせる
@@ -900,7 +932,7 @@ function regenFreeText(doc, d) {
         const sx = w / tw, sy = h / th, T = ftxMul(M, [sx, 0, 0, sy, -tx0 * sx, -ty0 * sy]);
         // 背景（塗り）が文字と同じ色で見えなくなるときは、文字を黒にする
         const bg = ftxFillOf(kept);
-        if (bg && ftxSame(bg, rgb)) rgb = [0, 0, 0];
+        if (bg && ftxSame(bg, rgb) && !force.rgb) rgb = [0, 0, 0];
         const refs = fontRefs(doc), Lo = layoutText(text, da.fs, w, { q, pad: 2 });
         hasJp = Lo.hasJp;
         const ops = [`q`, `${T.map(n3).join(' ')} cm`, kept, `Q`, `q`, `0 0 ${n3(w)} ${n3(h)} re W n`, `/EPAGS gs`, `${rgb.map(n3).join(' ')} rg`];
@@ -929,8 +961,8 @@ function regenFreeText(doc, d) {
     const bw = bwo && bwo.asNumber ? bwo.asNumber() : (bo && bo.length >= 3 ? bo[2] : 1);       // 枠線の太さ: /BS → /Border → 既定の1
     let fill = IC, bcolor = null;
     if (bw > 0) bcolor = C || rgb;                                                          // 枠線の色は /C（背景ではない）
-    else if (!IC && C) fill = C;                                                            // 枠線がなく /IC もない: /C を背景色として使う作成ソフトがある
-    if (fill && ftxSame(fill, rgb)) rgb = [0, 0, 0];                                        // 背景と同じ色の文字は見えないので黒にする
+    else if (!IC && C && !force.rebuild) fill = C;                                          // 枠線がなく /IC もない: /C を背景色として使う作成ソフトがある
+    if (fill && ftxSame(fill, rgb) && !force.rgb) rgb = [0, 0, 0];                                        // 背景と同じ色の文字は見えないので黒にする
     if (bcolor && fill && ftxSame(bcolor, fill)) bcolor = null;
     const ap = buildTextAP(doc, { w: rot % 180 ? h : w, h: rot % 180 ? w : h, rot, text, fs: da.fs, rgb, fill, bw: bcolor ? bw : 0, bcolor: bcolor || rgb, opacity, q, pad: 2 });
     hasJp = ap.hasJp; dict = ap.ref;
@@ -940,32 +972,233 @@ function regenFreeText(doc, d) {
   d.set(N('DA'), PDFString.of(daString(hasJp ? 'EPAJp' : 'Helv', da.fs, rgb)));              // /DA も、実際の文字の色に直す（次に編集したときに、また白になるのを防ぐ）
   d.delete(N('RC')); d.delete(N('DS'));
 }
-// 既存の直線・折れ線・多角形・雲形の外観（見た目）を、新しい頂点で作り直す。色・太さ・破線・塗り・不透明度・線端・雲の大きさは、注釈の設定から読む
-// （Acrobat などで作った注釈も、作成者・コメント・返信などはそのまま残し、形と外観だけを変える）
-function regenShapeAP(doc, d, pts) {
+// ---- 既存の注釈（Acrobat などで作ったもの）を、このアドオンの図形と同じ形のデータとして読む（v4.11）
+//  プロパティ欄での変更・外観の作り直し・手書き注釈へのまとめ、に使う
+const NATIVE_SHAPES = new Set(['Line', 'PolyLine', 'Polygon', 'Square', 'Circle', 'Ink']);      // 図形として読める種類
+const NATIVE_MARKUP = new Set(['Highlight', 'Underline', 'StrikeOut', 'Squiggly']);
+function pdfReader(doc) {
   const ctx = doc.context, N = (k) => PDFName.of(k), L = (o) => (o === undefined ? undefined : ctx.lookup(o));
-  const nums = (o) => { const a = L(o); return a instanceof PDFArray ? a.asArray().map((x) => { const v = L(x); return v && v.asNumber ? v.asNumber() : 0; }) : null; };
-  const name = (o) => { const v = L(o); return v && v.asString ? v.asString().slice(1) : ''; };
+  const num = (o) => { const v = L(o); return v && v.asNumber ? v.asNumber() : null; };
+  const nums = (o) => { const a = L(o); return a instanceof PDFArray ? a.asArray().map((x) => num(x) ?? 0) : null; };
+  const name = (o) => { const v = L(o); return v && v.asString ? v.asString().replace(/^\//, '') : ''; };
   const col = (a) => (!a || !a.length ? null : a.length >= 4 ? (() => { const k = 1 - a[3]; return [(1 - a[0]) * k, (1 - a[1]) * k, (1 - a[2]) * k]; })()
     : a.length >= 3 ? a.slice(0, 3) : [a[0], a[0], a[0]]);
-  const sub = name(d.get(N('Subtype'))), be = L(d.get(N('BE')));
-  const cloud = sub === 'Polygon' && be instanceof PDFDict && name(be.get(N('S'))) === 'C';
-  const type = sub === 'Line' ? 'line' : sub === 'PolyLine' ? 'polyline' : cloud ? 'cloud' : 'polygon';
+  return { ctx, N, L, num, nums, name, col };
+}
+// 注釈の辞書 → { type, pts | strokes, p, sub }。図形として読めないときは null（pts を渡すと頂点をそれに置き換える）
+function nativeShape(doc, d, pts) {
+  const { N, L, num, nums, name, col } = pdfReader(doc);
+  const sub = name(d.get(N('Subtype'))); if (!NATIVE_SHAPES.has(sub)) return null;
+  const be = L(d.get(N('BE'))), cloud = be instanceof PDFDict && name(be.get(N('S'))) === 'C';
   let w = 1, style = 'solid';
   const bs = L(d.get(N('BS')));
-  if (bs instanceof PDFDict) { const wv = L(bs.get(N('W'))); if (wv && wv.asNumber) w = wv.asNumber(); if (name(bs.get(N('S'))) === 'D') style = 'dashed'; }
+  if (bs instanceof PDFDict) { const wv = num(bs.get(N('W'))); if (wv !== null) w = wv; if (name(bs.get(N('S'))) === 'D') style = 'dashed'; }
   else { const bo = nums(d.get(N('Border'))); if (bo && bo.length >= 3) w = bo[2]; }
   const ends = new Set(LINE_ENDS.map((x) => x[0]));
   const le = L(d.get(N('LE'))), leN = le instanceof PDFArray ? le.asArray().map((x) => name(x)) : [];
-  const ca = L(d.get(N('CA'))), op = ca && ca.asNumber ? ca.asNumber() : 1;
-  const iv = be instanceof PDFDict ? L(be.get(N('I'))) : null;
+  const op = num(d.get(N('CA'))) ?? 1;
   const C = col(nums(d.get(N('C')))), IC = col(nums(d.get(N('IC'))));
-  const a = { type, pts, p: { color: rgb2hex(C || [0, 0, 0]), width: Math.max(w, 0.01), style, fill: IC && sub !== 'Line' && sub !== 'PolyLine' ? rgb2hex(IC) : null, opacity: op * 100,
-    start: ends.has(leN[0]) ? leN[0] : 'None', end: ends.has(leN[1]) ? leN[1] : 'None', startSize: 100, endSize: 100, intensity: iv && iv.asNumber ? iv.asNumber() : 1, radius: 0 } };
-  const [x0, y0, x1, y1] = primsBBox(shapePrims(a)), pad = Math.max(w * 1.5, 1) + 1;
+  const p = { color: rgb2hex(C || [0, 0, 0]), width: Math.max(w, sub === 'Ink' ? 0.25 : 0.01), style, fill: IC && sub !== 'Line' && sub !== 'PolyLine' && sub !== 'Ink' ? rgb2hex(IC) : null,
+    opacity: Math.round(op * 100), start: ends.has(leN[0]) ? leN[0] : 'None', end: ends.has(leN[1]) ? leN[1] : 'None', startSize: 100, endSize: 100,
+    intensity: (be instanceof PDFDict ? num(be.get(N('I'))) : null) || 1, radius: 0 };
+  const pairs = (a) => { const o = []; for (let i = 0; a && i + 1 < a.length; i += 2) o.push([a[i], a[i + 1]]); return o; };
+  if (sub === 'Ink') {
+    const il = L(d.get(N('InkList'))); if (!(il instanceof PDFArray)) return null;
+    const strokes = il.asArray().map((x) => pairs(nums(x))).filter((q) => q.length).map((q) => ({ pts: q, color: p.color, width: p.width, op: 1 }));
+    return strokes.length ? { sub, type: 'ink', pts: [], strokes, p } : null;
+  }
+  if (sub === 'Square' || sub === 'Circle') {
+    const R0 = nums(d.get(N('Rect'))); if (!R0) return null;
+    const R = [Math.min(R0[0], R0[2]), Math.min(R0[1], R0[3]), Math.max(R0[0], R0[2]), Math.max(R0[1], R0[3])];
+    const rd = nums(d.get(N('RD'))), ins = rd && rd.length === 4 ? rd : [w / 2, w / 2, w / 2, w / 2];
+    const x0 = R[0] + ins[0], y0 = R[1] + ins[1], x1 = Math.max(x0 + 0.1, R[2] - ins[2]), y1 = Math.max(y0 + 0.1, R[3] - ins[3]);
+    if (sub === 'Square' && cloud) return { sub, type: 'cloud', pts: [[x0, y0], [x1, y0], [x1, y1], [x0, y1]], p, box: true };
+    return { sub, type: sub === 'Square' ? 'rect' : 'ellipse', pts: [[x0, y0], [x1, y1]], p };
+  }
+  if (!pts) {
+    if (sub === 'Line') { const l = nums(d.get(N('L'))); if (!l || l.length < 4) return null; pts = [[l[0], l[1]], [l[2], l[3]]]; }
+    else {
+      pts = pairs(nums(d.get(N('Vertices'))));
+      if (sub === 'Polygon' && pts.length > 3) { const a = pts[0], b = pts[pts.length - 1]; if (Math.hypot(a[0] - b[0], a[1] - b[1]) < 0.01) pts.pop(); }
+    }
+  }
+  if (pts.length < (sub === 'Polygon' ? 3 : 2)) return null;
+  return { sub, type: sub === 'Line' ? 'line' : sub === 'PolyLine' ? 'polyline' : cloud ? 'cloud' : 'polygon', pts, p };
+}
+// 既存の図形の注釈の外観（見た目）を、注釈の設定（色・太さ・破線・塗り・不透明度・線端・雲の大きさ）と形から作り直す
+// 作成者・コメント・返信などはそのまま残し、/Rect と外観だけを変える
+function regenNativeAP(doc, d, pts) {
+  const a = nativeShape(doc, d, pts); if (!a) return;
+  const { ctx, N } = pdfReader(doc), op = a.p.opacity / 100;
+  const [x0, y0, x1, y1] = primsBBox(shapePrims(a)), pad = Math.max(a.p.width * 1.5, 1) + 1;
   const R = [x0 - pad, y0 - pad, x1 + pad, y1 + pad];
   const ap = ctx.register(ctx.stream(buildAP(a), { Type: 'XObject', Subtype: 'Form', BBox: R, Resources: { ExtGState: { GS0: { Type: 'ExtGState', CA: op, ca: op } } } }));
-  d.set(N('Rect'), ctx.obj(R)); d.set(N('AP'), ctx.obj({ N: ap })); d.delete(N('RD'));
+  d.set(N('Rect'), ctx.obj(R)); d.set(N('AP'), ctx.obj({ N: ap }));
+  if (a.sub === 'Square' || a.sub === 'Circle') {           // 枠（Rect）と図形の間の幅を /RD に書く（次に読んだときに、同じ大きさの図形になるように）
+    const xs = a.pts.map((q) => q[0]), ys = a.pts.map((q) => q[1]);
+    d.set(N('RD'), ctx.obj([Math.min(...xs) - R[0], Math.min(...ys) - R[1], R[2] - Math.max(...xs), R[3] - Math.max(...ys)].map((v) => Math.max(0, v))));
+  } else d.delete(N('RD'));
+}
+const regenShapeAP = regenNativeAP;
+// ハイライト・下線・取り消し線・波線の外観を、/QuadPoints・色・不透明度から作り直す
+function regenMarkupAP(doc, d) {
+  const { ctx, N, num, nums, name, col } = pdfReader(doc);
+  const sub = name(d.get(N('Subtype'))), qp = nums(d.get(N('QuadPoints'))); if (!qp || qp.length < 8) return;
+  const rgb = col(nums(d.get(N('C')))) || [1, 1, 0], op = num(d.get(N('CA'))) ?? 1, ops = ['/GS0 gs'];
+  let bx0 = Infinity, by0 = Infinity, bx1 = -Infinity, by1 = -Infinity;
+  for (let i = 0; i + 7 < qp.length; i += 8) {
+    const q = [[qp[i], qp[i + 1]], [qp[i + 2], qp[i + 3]], [qp[i + 4], qp[i + 5]], [qp[i + 6], qp[i + 7]]];   // 左上・右上・左下・右下
+    for (const [x, y] of q) { bx0 = Math.min(bx0, x); by0 = Math.min(by0, y); bx1 = Math.max(bx1, x); by1 = Math.max(by1, y); }
+    const h = Math.hypot(q[0][0] - q[2][0], q[0][1] - q[2][1]) || 1;
+    const at = (t) => [[q[2][0] + (q[0][0] - q[2][0]) * t, q[2][1] + (q[0][1] - q[2][1]) * t], [q[3][0] + (q[1][0] - q[3][0]) * t, q[3][1] + (q[1][1] - q[3][1]) * t]];
+    if (sub === 'Highlight') { ops.push(`${rgb.map(n3).join(' ')} rg`, `${n3(q[0][0])} ${n3(q[0][1])} m ${n3(q[1][0])} ${n3(q[1][1])} l ${n3(q[3][0])} ${n3(q[3][1])} l ${n3(q[2][0])} ${n3(q[2][1])} l h f`); continue; }
+    const lw = Math.max(0.5, h / 14);
+    ops.push(`${rgb.map(n3).join(' ')} RG`, `${n3(lw)} w`);
+    if (sub === 'Squiggly') {
+      const [A, B] = at(0.08), len = Math.hypot(B[0] - A[0], B[1] - A[1]) || 1, ux = (B[0] - A[0]) / len, uy = (B[1] - A[1]) / len, st = Math.max(1.5, h / 6), amp = h / 14;
+      const pts = []; for (let t = 0, k = 0; t <= len; t += st, k++) { const o = k % 2 ? amp : -amp; pts.push([A[0] + ux * t - uy * o, A[1] + uy * t + ux * o]); }
+      pts.forEach((p, k) => ops.push(`${n3(p[0])} ${n3(p[1])} ${k ? 'l' : 'm'}`)); ops.push('S');
+    } else { const [A, B] = at(sub === 'StrikeOut' ? 0.45 : 0.07); ops.push(`${n3(A[0])} ${n3(A[1])} m ${n3(B[0])} ${n3(B[1])} l S`); }
+  }
+  const R = [bx0 - 1, by0 - 1, bx1 + 1, by1 + 1];
+  const gs = { Type: 'ExtGState', CA: op, ca: op, ...(sub === 'Highlight' ? { BM: 'Multiply' } : {}) };
+  const ap = ctx.register(ctx.stream(ops.join('\n'), { Type: 'XObject', Subtype: 'Form', BBox: R, Resources: { ExtGState: { GS0: gs } } }));
+  d.set(N('Rect'), ctx.obj(R)); d.set(N('AP'), ctx.obj({ N: ap }));
+}
+// 既存の注釈の、プロパティ欄に出す値（読めないものは含めない）
+function nativeProps(doc, d) {
+  const { N, L, num, nums, name, col } = pdfReader(doc);
+  const sub = name(d.get(N('Subtype')));
+  const sh = nativeShape(doc, d); if (sh) return { ...sh.p, cloud: sh.type === 'cloud' };
+  const op = Math.round((num(d.get(N('CA'))) ?? 1) * 100), C = col(nums(d.get(N('C'))));
+  if (NATIVE_MARKUP.has(sub)) return { color: rgb2hex(C || [1, 1, 0]), opacity: op };
+  if (sub === 'FreeText') {
+    const str = (o) => { const v = L(o); return v && v.decodeText ? v.decodeText() : ''; };
+    const da = parseDA(str(d.get(N('DA')))), apD = L(d.get(N('AP'))), apN = apD instanceof PDFDict ? apD.get(N('N')) : null;
+    const rgb = (apN ? ftxApColor(ftxApText(doc.context, apN)) : null) || ftxRcColor(str(d.get(N('RC')))) || da.rgb;
+    const bs = L(d.get(N('BS'))), bo = nums(d.get(N('Border')));
+    const w = bs instanceof PDFDict && num(bs.get(N('W'))) !== null ? num(bs.get(N('W'))) : bo && bo.length >= 3 ? bo[2] : 1;
+    const IC = col(nums(d.get(N('IC'))));
+    return { color: rgb2hex(rgb), fontSize: Math.round(da.fs * 10) / 10, width: w, fill: IC ? rgb2hex(IC) : null, opacity: op, face: 'gothic' };
+  }
+  return {};
+}
+// 既存の注釈ごとに、プロパティ欄で変えられる項目
+function nativeCaps(n) {
+  const s = n.subtype;
+  if (encLocked()) return [];
+  if (s === 'Line' || s === 'PolyLine') return ['start', 'end', 'style', 'width', 'color', 'opacity'];
+  if (s === 'Polygon') return ['style', 'width', 'color', 'fill', 'opacity', ...(n.props && n.props.cloud ? ['intensity'] : [])];
+  if (s === 'Square' || s === 'Circle') return ['style', 'width', 'color', 'fill', 'opacity', ...(n.props && n.props.cloud ? ['intensity'] : [])];
+  if (s === 'Ink') return ['width', 'color', 'opacity'];
+  if (s === 'FreeText') return ['width', 'color', 'fill', 'opacity', 'font'];
+  if (NATIVE_MARKUP.has(s)) return ['color', 'opacity'];
+  return [];
+}
+// 元のPDF（S.baseBytes）を pdf-lib で読んだもの。読むだけに使う（変更しない）。元のPDFが変わったら読み直す
+function baseDoc() {
+  if (!S.baseDoc || S.baseDoc.bytes !== S.baseBytes) S.baseDoc = { bytes: S.baseBytes, p: PDFDocument.load(S.baseBytes, { updateMetadata: false }) };
+  return S.baseDoc.p;
+}
+// 選択中の既存の注釈の、プロパティの値を読む（まだ読んでいないものだけ）。読み終えたらプロパティ欄を更新する
+function loadNativeProps(list) {
+  const need = list.filter((n) => n.props === undefined); if (!need.length) return;
+  for (const n of need) n.props = null;
+  baseDoc().then((doc) => {
+    for (const n of need) { try { const d = doc.context.lookupMaybe(refFromId(n.id), PDFDict); n.props = d ? nativeProps(doc, d) : {}; } catch (e) { n.props = {}; } }
+    if (need.some((n) => S.sel.has(n.key))) { syncProps(); updateButtons(); }
+  }).catch(() => { for (const n of need) n.props = {}; });
+}
+function applyNativeProps(doc, d, pr) {
+  const { ctx, N, L, num, nums, name } = pdfReader(doc), sub = name(d.get(N('Subtype')));
+  const rgbArr = (h) => ctx.obj(hex2rgb(h));
+  if (pr.opacity !== undefined) d.set(N('CA'), ctx.obj(clamp(pr.opacity, 0, 100) / 100));
+  if (pr.width !== undefined || pr.style !== undefined) {
+    const bs = L(d.get(N('BS'))), bo = nums(d.get(N('Border')));
+    const cw = bs instanceof PDFDict && num(bs.get(N('W'))) !== null ? num(bs.get(N('W'))) : bo && bo.length >= 3 ? bo[2] : 1;
+    const dashed = pr.style !== undefined ? pr.style !== 'solid' : bs instanceof PDFDict && name(bs.get(N('S'))) === 'D';
+    const w = pr.width !== undefined ? pr.width : cw;
+    d.set(N('BS'), ctx.obj({ Type: 'Border', W: w, S: dashed ? 'D' : 'S', ...(dashed ? { D: [3, 3] } : {}) }));
+    d.delete(N('Border'));
+  }
+  if (pr.start !== undefined || pr.end !== undefined) {
+    const le = L(d.get(N('LE'))), cur = le instanceof PDFArray ? le.asArray().map((x) => name(x)) : ['None', 'None'];
+    d.set(N('LE'), ctx.obj([PDFName.of(pr.start ?? cur[0] ?? 'None'), PDFName.of(pr.end ?? cur[1] ?? 'None')]));
+  }
+  if (pr.intensity !== undefined) { const be = L(d.get(N('BE'))); if (be instanceof PDFDict) be.set(N('I'), ctx.obj(pr.intensity)); }
+  if (sub === 'FreeText') {
+    const str = (o) => { const v = L(o); return v && v.decodeText ? v.decodeText() : ''; };
+    const da = parseDA(str(d.get(N('DA'))));
+    const rgb = pr.color !== undefined ? hex2rgb(pr.color) : null, fs = pr.fontSize ?? da.fs;
+    if (pr.fill !== undefined) { if (pr.fill) d.set(N('IC'), rgbArr(pr.fill)); else d.delete(N('IC')); }
+    if (pr.width !== undefined && pr.width > 0 && !d.get(N('C'))) d.set(N('C'), rgbArr(pr.color || rgb2hex(da.rgb)));
+    d.set(N('DA'), PDFString.of(daString('Helv', fs, rgb || da.rgb)));
+    regenFreeText(doc, d, { rgb, rebuild: pr.fill !== undefined || pr.width !== undefined || pr.style !== undefined });
+    return;
+  }
+  if (pr.color !== undefined) d.set(N('C'), rgbArr(pr.color));
+  if (pr.fill !== undefined) { if (pr.fill) d.set(N('IC'), rgbArr(pr.fill)); else d.delete(N('IC')); }
+  if (NATIVE_SHAPES.has(sub)) regenNativeAP(doc, d);
+  else if (NATIVE_MARKUP.has(sub)) regenMarkupAP(doc, d);
+}
+/* ---- しおり（PDFのアウトライン）の編集（v4.11.1）
+ *  しおりは、パス（同じ階層の中での番号を、上の階層から順に並べたもの。例 [0, 2]）で指す。PDF.js の getOutline と同じ順番になる。
+ *  op: { type: 'bm', act: 'add' | 'rename' | 'del', path, title, page, top } */
+function outlineEdit(doc, op) {
+  const ctx = doc.context, N = (k) => PDFName.of(k), cat = doc.catalog;
+  let rootRef = cat.get(N('Outlines')), root = rootRef ? ctx.lookup(rootRef) : null;
+  if (!(root instanceof PDFDict)) {
+    if (op.act !== 'add') return;
+    root = ctx.obj({ Type: 'Outlines' }); rootRef = ctx.register(root); cat.set(N('Outlines'), rootRef);
+  }
+  if (!(rootRef instanceof PDFRef)) { rootRef = ctx.register(root); cat.set(N('Outlines'), rootRef); }
+  const kids = (d) => {                                   // 子のしおり（参照）の一覧
+    const o = [], seen = new Set(); let r = d.get(N('First'));
+    while (r instanceof PDFRef && !seen.has(r.tag)) { seen.add(r.tag); o.push(r); const x = ctx.lookup(r); r = x instanceof PDFDict ? x.get(N('Next')) : null; }
+    return o;
+  };
+  const relink = (pRef, pd, list) => {                   // 子の並びを書き直す（First / Last / Prev / Next / Parent）
+    list.forEach((r, i) => {
+      const d = ctx.lookup(r); d.set(N('Parent'), pRef);
+      if (i > 0) d.set(N('Prev'), list[i - 1]); else d.delete(N('Prev'));
+      if (i < list.length - 1) d.set(N('Next'), list[i + 1]); else d.delete(N('Next'));
+    });
+    if (list.length) { pd.set(N('First'), list[0]); pd.set(N('Last'), list[list.length - 1]); } else { pd.delete(N('First')); pd.delete(N('Last')); pd.delete(N('Count')); }
+  };
+  const at = (path) => {                                  // パスの位置の、親と兄弟の一覧と番号
+    let pRef = rootRef, pd = root;
+    for (let k = 0; k < path.length - 1; k++) { const ks = kids(pd); const r = ks[path[k]]; if (!r) return null; pRef = r; pd = ctx.lookup(r); }
+    return { pRef, pd, list: kids(pd), i: path[path.length - 1] };
+  };
+  const num = (o) => { const v = ctx.lookup(o); return v && v.asNumber ? v.asNumber() : 0; };
+  if (op.act === 'add') {
+    const pg = doc.getPages()[op.page - 1]; if (!pg) return;
+    const item = ctx.obj({ Title: PDFHexString.fromText(op.title), Dest: [pg.ref, 'XYZ', null, op.top == null ? null : op.top, null] });
+    const ref = ctx.register(item);
+    const pos = op.path ? at(op.path) : { pRef: rootRef, pd: root, list: kids(root), i: kids(root).length - 1 };
+    if (!pos) return;
+    pos.list.splice(pos.i + 1, 0, ref); relink(pos.pRef, pos.pd, pos.list);
+  } else {
+    const pos = at(op.path); if (!pos || !pos.list[pos.i]) return;
+    const ref = pos.list[pos.i], d = ctx.lookup(ref);
+    if (op.act === 'rename') d.set(N('Title'), PDFHexString.fromText(op.title));
+    else if (op.act === 'del') {
+      pos.list.splice(pos.i, 1); relink(pos.pRef, pos.pd, pos.list);
+      const kill = (r) => { const x = ctx.lookup(r); if (x instanceof PDFDict) for (const c of kids(x)) kill(c); ctx.delete(r); };
+      kill(ref);
+    }
+  }
+  // 開いている数（Count）を数え直す。しおりの開閉（正: 開いている／負: 閉じている）はそのまま
+  const recount = (d, isRoot) => {
+    const ks = kids(d); let vis = 0;
+    for (const r of ks) { const c = ctx.lookup(r); const open = num(c.get(N('Count'))) > 0; const sub = recount(c, false); vis += 1 + (open ? sub : 0); }
+    if (isRoot) { if (vis) d.set(N('Count'), ctx.obj(vis)); else d.delete(N('Count')); }
+    else if (ks.length) { const open = num(d.get(N('Count'))) > 0; d.set(N('Count'), ctx.obj(open ? vis : -vis)); }
+    else d.delete(N('Count'));
+    return vis;
+  };
+  recount(root, true);
+  if (!kids(root).length) cat.delete(N('Outlines'));
 }
 // PDFにもともとあった注釈（コメント）の変更・削除・配置順の変更を、元のPDFに直接反映する
 async function nativeEdit(ops) {
@@ -985,6 +1218,7 @@ async function nativeEdit(ops) {
   };
   const subOf = (d) => { const s = ctx.lookup(d.get(N('Subtype'))); return s && s.asString ? s.asString().slice(1) : ''; };
   for (const op of ops) {
+    if (op.type === 'bm') { outlineEdit(doc, op); continue; }
     const page = pages[op.page - 1]; if (!page) continue;
     if (op.type === 'order') {                       // 配置順（v3.6）: 複数のidをまとめて扱う
       const arr = page.node.Annots(); if (!arr) continue;
@@ -1011,6 +1245,10 @@ async function nativeEdit(ops) {
       if (subOf(d) === 'Line') d.set(N('L'), ctx.obj([...op.pts[0], ...op.pts[1]]));
       else d.set(N('Vertices'), ctx.obj((op.dup ? [...op.pts, op.pts[0]] : op.pts).flat()));
       regenShapeAP(doc, d, op.pts);
+      d.set(N('M'), PDFString.of(pdfDate()));
+    } else if (op.type === 'props') {           // プロパティ欄での変更（v4.11）: 色・塗り・太さ・線の種類・不透明度・線端・文字の大きさ
+      if (!d) continue;
+      applyNativeProps(doc, d, op.props);
       d.set(N('M'), PDFString.of(pdfDate()));
     } else if (op.type === 'resize') {
       if (!d) continue;
@@ -1076,11 +1314,32 @@ function gcDoc(doc) {
   dead.forEach((r) => ctx.delete(r));
   return dead.length;
 }
+/* ---- 編集ロック（v4.11.1）: 使えない機能をグレーアウトする
+ *  enc: 暗号化されている（ページの回転・整理・内容の編集・既存の注釈の変更・しおりの編集など、PDFの中身を作り直す機能が使えない）
+ *  annot / print: 文書の設定（権限）で、注釈の追加／印刷が許可されているか */
+const encLocked = () => !!(S.lock.enc || S.libErr);
+async function refreshLock() {
+  const pdf = S.pdf, bytes = S.baseBytes; if (!pdf || !bytes) return;
+  let enc = null, perms = null;
+  try { enc = await UNLOCK.info(bytes); } catch { /* ignore */ }
+  try { perms = await pdf.getPermissions(); } catch { /* ignore */ }
+  if (pdf !== S.pdf) return;
+  S.lock = { enc: !!(enc && !enc.error), annot: !perms || perms.includes(0x20), print: !perms || perms.includes(0x04) };
+  updateButtons(); syncProps();
+  if (!S.lock.annot && !['select', 'asel', 'edit'].includes(S.tool)) setTool('select');
+  if (encLocked() && S.tool === 'edit') setTool('select');
+}
 async function probeLib(bytes, gen) {
   S.libErr = false; showWarn();
-  if (bytes.length > 40e6) return;
+  if (bytes.length > 40e6) { refreshLock(); return; }               // 大きなPDFは pdf-lib での試し読みを省く（暗号化は refreshLock で調べる）
+  await refreshLock();
+  if (gen !== S.loadGen) return;
+  if (S.lock.enc) return;                                            // 暗号化されている: pdf-lib では読めないことが分かっているので、試し読みしない
+  await new Promise((r) => (window.requestIdleCallback ? requestIdleCallback(r, { timeout: 1500 }) : setTimeout(r, 0)));
+  if (gen !== S.loadGen) return;
   try { await PDFDocument.load(bytes, { updateMetadata: false }); }
   catch (e) { if (gen !== S.loadGen) return; S.libErr = friendlyError(e) + '\n（' + ((e && e.message) || e).slice(0, 160) + '）'; showWarn(); }
+  if (gen === S.loadGen) refreshLock();
 }
 function showWarn() {
   $('#warn').hidden = true; return;            // v3.9: 編集ロック（暗号化・セキュリティ設定）の警告は表示しない（判定結果 S.libErr は内部で使う）
@@ -1102,7 +1361,7 @@ function showMsg(html, err = false) {
 function pdfjsOpts(bytes) {
   return { data: bytes.slice(), cMapUrl: LIB + 'cmaps/', cMapPacked: true,
     standardFontDataUrl: LIB + 'standard_fonts/', wasmUrl: LIB + 'wasm/', iccUrl: LIB + 'iccs/',
-    useSystemFonts: true, disableFontFace: S.textMode === 'outline' };
+    useSystemFonts: true, disableFontFace: S.textMode === 'outline', worker: PDFW };
 }
 async function openPdfJs(bytes) {
   const task = pdfjsLib.getDocument(pdfjsOpts(bytes));
@@ -1122,11 +1381,14 @@ async function loadFromBytes(bytes, name, { handle = null, url = null, page = 1 
   const head = new TextDecoder('latin1').decode(bytes.subarray(0, 1024));
   if (!head.includes('%PDF')) throw new Error('PDF形式のファイルではありません。');
   let annots = [], base = bytes;
-  if (bytesContain(bytes, 'EPAType') || bytesContain(bytes, MARKER)) {
+  // v4.11.1: PDF.js での読み込み（作業スレッド）と、このアドオンの注釈があるかの確認（画面のスレッド）を同時に進める
+  let pdfP = openPdfJs(bytes);
+  if (bytesContain(bytes, 'EPAType', MARKER)) {
     try { const r = await extractOurs(bytes); base = r.bytes; annots = r.annots; }
     catch (e) { console.warn('既存図形の取り込みに失敗', e); }
+    if (base !== bytes) { pdfP.then((p) => p.destroy()).catch(() => {}); pdfP = openPdfJs(base); }
   }
-  const pdf = await openPdfJs(base);
+  const pdf = await pdfP;
   if (gen !== S.loadGen) { pdf.destroy(); return; }
   swapPdf(pdf);
   ceOnBase(null); ceLeave();
@@ -1138,22 +1400,34 @@ async function loadFromBytes(bytes, name, { handle = null, url = null, page = 1 
   msgEl.style.display = 'none';
   await buildPages(page);
   syncProps(); updateButtons(); scheduleList();
-  collectNatives();
+  refreshLock();                                                          // 編集ロックの確認は軽いので、すぐ行う（使えないボタンを早くグレーアウトする）
+  // v4.11.1: 既存の注釈・しおりの一覧や、pdf-lib での試し読みは、最初のページが表示されてから行う（表示を待たせない）
+  await afterFirstPaint(gen);
+  if (gen !== S.loadGen) return;
+  collectNatives(); collectOutline();
   probeLib(base, gen);
+}
+// 表示中のページが描き終わるまで待つ（最長2秒）
+function afterFirstPaint(gen) {
+  return new Promise((res) => {
+    const t0 = performance.now();
+    const tick = () => { const p = S.pages[S.cur - 1]; if (gen !== S.loadGen || (p && p.rendered) || performance.now() - t0 > 2000) res(); else setTimeout(tick, 30); };
+    tick();
+  });
 }
 async function setBase(bytes, { keepScroll = true } = {}) {
   const sy = wrap.scrollTop, cur = S.cur;
   if (S.editing) endEdit(false);
   const pdf = await openPdfJs(bytes);
   // v3.7: ページ数が同じなら、表示を作り直さずに差し替える（今の表示を残したまま描き直すので、白くならない）
-  if (keepScroll && S.pdf && S.pages.length === pdf.numPages) { await swapInPlace(pdf, bytes); return; }
+  if (keepScroll && S.pdf && S.pages.length === pdf.numPages) { await swapInPlace(pdf, bytes); refreshLock(); collectOutline(); return; }
   swapPdf(pdf);
   ceOnBase(bytes);
   S.baseBytes = bytes; S.draft = null; S.drag = null; S.ghost = null;
   await buildPages(Math.min(cur, pdf.numPages));
   if (keepScroll) wrap.scrollTop = sy;
   syncProps(); updateButtons(); scheduleList();
-  collectNatives();
+  collectNatives(); refreshLock(); collectOutline();
 }
 /** 文書を差し替える（ページの枠と描画済みの画像はそのまま。新しい内容の描画ができたページから、一度に入れ替える） */
 async function swapInPlace(pdf, bytes) {
@@ -1210,6 +1484,7 @@ async function buildPages(startPage = 1) {
   if (S.paged) wrap.scrollTop = 0; else if (startPage > 1) S.pages[S.cur - 1]?.el.scrollIntoView();
   $('#pageNum').value = S.cur;
   (async () => {
+    await afterFirstPaint(gen);                                         // 残りのページの寸法の読み込みは、最初のページを描いてから
     for (let i = 2; i <= pdf.numPages; i++) {
       if (gen !== S.loadGen || pdf !== S.pdf) return;
       const p = S.pages[i - 1]; if (!p.pageObj) p.pageObj = await pdf.getPage(i);
@@ -1285,6 +1560,7 @@ function layoutZoom(anchor, modeChanged) {
     const d = cy < r.top ? r.top - cy : cy > r.bottom ? cy - r.bottom : 0;
     if (d < bd) { bd = d; ref = p; fx = (cx - r.left) / r.width; fy = (cy - r.top) / r.height; if (d === 0) break; }
   }
+  if (ZT.k !== 1 || ZT.tx || ZT.ty) setZoomTransform(1, 0, 0);        // 拡大縮小の途中の見た目（transform）を外してから、本当の大きさにする
   for (const p of S.pages) { if (S.paged && !p.pageObj && p.num !== S.cur) { p.scale = S.scale; continue; } applyScale(p); }
   applyPaged();
   void wrap.offsetHeight;
@@ -1329,23 +1605,50 @@ function stepZoom(scale) {
 }
 /* ホイール拡大縮小は、1フレームに1回だけレイアウトに反映する */
 let zRaf = 0, zTarget = 0, zAnchor = null;
+/* ---- ホイール・ピンチでの拡大縮小（v4.11.1）
+ *  回している間は、ページの並び（#pages）全体を CSS の transform で拡大縮小して見せるだけにする（ページごとの大きさの計算・
+ *  レイアウトのやり直しをしない＝何千ページあっても軽い）。止まったら（約0.17秒後）1回だけ本当の大きさに直し、描き直す。 */
+const ZT = { k: 1, tx: 0, ty: 0 };
+const visScale = () => S.scale * ZT.k;                       // 画面に見えている倍率（拡大縮小の途中を含む）
+function setZoomTransform(k, tx, ty) {
+  ZT.k = k; ZT.tx = tx; ZT.ty = ty;
+  pagesEl.style.transformOrigin = '0 0';
+  pagesEl.style.transform = k === 1 && !tx && !ty ? '' : `translate(${tx}px, ${ty}px) scale(${k})`;
+}
 function zoomByFactor(factor, anchor) {
   if (!S.pdf) return;
   if (!zRaf && fitPaged()) {                                // 縦に収める／ページ全体: 縮小は無視。拡大したら、その選択を覚えておく
     if (factor <= 1) return;
     S.fitMem = S.fit; S.fitMemScale = S.scale;
   }
-  zTarget = clamp((zRaf ? zTarget : S.scale) * factor, 0.1, 8); zAnchor = anchor;
-  S.zooming = true; clearTimeout(zoomTimer); zoomTimer = setTimeout(commitRender, 170);
+  zTarget = clamp((zRaf ? zTarget : visScale()) * factor, 0.1, 8); zAnchor = anchor;
+  if (!S.zooming) for (const q of [...RS.active]) cancelRender(q);          // 拡大縮小の始まり: 描画中のページは取りやめる（倍率が変わるので使わない）
+  S.zooming = true; clearTimeout(zoomTimer); zoomTimer = setTimeout(commitZoom, 200);
   if (zRaf) return;
   zRaf = requestAnimationFrame(() => {
     zRaf = 0;
     const mem = S.paged ? S.fitMem : null;
-    if (mem && zTarget < S.scale && zTarget <= fitFloor(mem) * 1.004) { restoreFit(mem); return; }   // 元の大きさまで縮小した: 選択を保ったまま「収まる表示」に戻る
-    if (Math.abs(zTarget - S.scale) < 1e-6) return;
-    S.scale = zTarget; S.fit = null; pfTok++;
-    syncZoomUi(); layoutZoom(zAnchor, false);
+    if (mem && zTarget < visScale() && zTarget <= fitFloor(mem) * 1.004) { setZoomTransform(1, 0, 0); restoreFit(mem); return; }   // 元の大きさまで縮小した: 選択を保ったまま「収まる表示」に戻る
+    const f = zTarget / visScale();
+    if (Math.abs(f - 1) < 1e-6) return;
+    S.fit = null; pfTok++;
+    // カーソルの下の点が動かないように、拡大縮小の中心を合わせる（#pages の左上を原点とした座標で計算）
+    const wr = wrap.getBoundingClientRect();
+    const ax = (zAnchor ? zAnchor.x : wr.left + wr.width / 2) - wr.left + wrap.scrollLeft - pagesEl.offsetLeft;
+    const ay = (zAnchor ? zAnchor.y : wr.top + wr.height / 2) - wr.top + wrap.scrollTop - pagesEl.offsetTop;
+    const k2 = ZT.k * f, cp = S.pages[S.cur - 1];
+    let tx2 = ax - f * (ax - ZT.tx);
+    // 縮小してページの幅が画面より狭くなるときは、本当のレイアウトと同じく左右の中央に置く（止まったときに横にずれないように）
+    if (f < 1 && cp && cp.el.offsetWidth * k2 <= wrap.clientWidth - 2 && wrap.scrollLeft === 0) tx2 = (pagesEl.offsetWidth / 2) * (1 - k2);
+    setZoomTransform(k2, tx2, ay - f * (ay - ZT.ty));
+    const s0 = S.scale; S.scale = visScale(); syncZoomUi(); S.scale = s0;            // 倍率の表示は、見えている倍率にする
   });
+}
+// 拡大縮小が止まった: 本当の大きさにレイアウトし直して（カーソルの下の点はそのまま）、描き直す
+function commitZoom() {
+  if (zRaf) { cancelAnimationFrame(zRaf); zRaf = 0; }
+  if (ZT.k !== 1 || ZT.tx || ZT.ty) { S.scale = clamp(visScale(), 0.1, 8); syncZoomUi(); layoutZoom(zAnchor, false); }
+  commitRender();
 }
 /* ------------------------------------------------------- 1ページ表示（先読み付き） */
 /* 表示するページ以外は、画面の外に置いたまま（visibility:hidden）描画しておく。切り替えは「表示位置の入れ替え」だけなので、白い画面が出ない */
@@ -1353,10 +1656,10 @@ function applyPaged() {
   document.body.classList.toggle('paged', !!S.paged);
   for (const p of S.pages) p.el.classList.toggle('off', S.paged && p.num !== S.cur);
 }
-/** 保持（先読み）するページ: 前後1ページと、進行方向の2ページ先 */
+/** 保持（先読み）するページ: 前後1ページと、進行方向の3ページ先まで */
 function setKeep(n) {
   const N = S.pdf ? S.pdf.numPages : 0, d = S.dirNav || 1;
-  S.keep = new Set([n - 1, n, n + 1, n + 2 * d, S.cur].filter((x) => x >= 1 && x <= N));
+  S.keep = new Set([n - 1, n, n + 1, n + 2 * d, n + 3 * d, S.cur].filter((x) => x >= 1 && x <= N));
 }
 function releaseOutside() { for (const p of S.pages) if ((p.rendered || p.rendering) && !S.keep.has(p.num)) releasePage(p); }
 async function ensurePage(p) {
@@ -1364,14 +1667,15 @@ async function ensurePage(p) {
   applyScale(p);
 }
 let pfTok = 0;
+// 先読み: 描く順番は renderPrio（行き先に近いページから）が決める。PDF.js の作業スレッドでの読み込みは、描画と並行して進む
 async function prefetch(n) {
   const tok = ++pfTok, d = S.dirNav || 1;
-  for (const m of [n + d, n + 2 * d, n - d]) {              // 進行方向を優先して先読み
+  for (const m of [n + d, n + 2 * d, n - d, n + 3 * d]) {
     if (tok !== pfTok || !S.paged || !S.pdf) return;
     if (m < 1 || m > S.pdf.numPages || !S.keep.has(m)) continue;
     const p = S.pages[m - 1]; if (!p) continue;
     await ensurePage(p); if (tok !== pfTok) return;
-    await renderPage(p);
+    renderPage(p);
   }
 }
 function startPaged() {         // 読み込み直後・ズーム変更後: 現在のページを先に描き、そのあと前後を先読み
@@ -1379,77 +1683,59 @@ function startPaged() {         // 読み込み直後・ズーム変更後: 現�
   const p = S.pages[S.cur - 1]; if (!p) return;
   renderPage(p); prefetch(S.cur);
 }
-/* ---- ページ切り替え（v2.9）
- *  行き先(S.want)だけを先に更新し、表示は「行き先に近い、描画済みのページ」へ順に入れ替える。
- *  描画待ちのために前の切り替えを取り消さないので、ホイールやキーを回し続けても詰まらず、白い画面も出ない。 */
-let pumpP = null, navWhere = 'top';
-function showNow(n, where) {
+/* ---- ページ切り替え（v4.11.1: 高速なページ送り）
+ *  ホイール・キーを回したら、描画を待たずにすぐ次のページへ切り替える（まだ描いていないページは「レンダリング中…」と表示）。
+ *  続けて切り替えている間は描画を始めず、止まったところ（最後の切り替えから約0.15秒）で、そのページと前後のページを描く。
+ *  これで、数百ページでも引っかからずに送れる。 */
+let flipTimer = 0;
+const FLIP_SETTLE = 150;
+function showNow(n, where, fast = false) {
   const p = S.pages[n - 1]; if (!p) return;
   if (S.editing) endEdit(true);
+  if (p.pageObj && !S.zooming) applyScale(p); else p.scale = pageScale(p);
   S.cur = n; S.scale = p.scale; syncZoomUi(); setKeep(S.want);
   applyPaged(); $('#pageNum').value = n;
   void wrap.offsetHeight;
   wrap.scrollTop = where === 'bottom' ? wrap.scrollHeight : 0;
-  if (!p.rendered || p.rscale !== p.scale) renderPage(p);        // 未描画／拡大縮小で古くなっていれば、表示しながら描き直す
-  releaseOutside(); prefetch(S.want); scheduleList(); updatePgBar();
+  releaseOutside(); scheduleList(); updatePgBar();
+  if (fast) { flipSettle(); return; }                              // 続けて切り替えている: 止まってから描く
+  if (!p.rendered || p.rscale !== p.scale) ensurePage(p).then(() => { if (S.cur === n) { applyScale(p); renderPage(p); } }).catch(() => {});
+  prefetch(S.want);
 }
-// 1ページ表示: 表示したいページ（S.want）になるまで、ページの切り替えを順に進める
-function pump() {
-  if (pumpP) return pumpP;
-  // 注意: 切り替え先が今のページと同じだと、下の非同期関数は同期的に終わる。終了処理で pumpP を消すのは、
-  //       代入のあと（finally のコールバック）で行う（v3.2: 回転後などにページ切り替えが止まる不具合の修正）
-  const me = (async () => {
-    const lg = S.loadGen, pdf = S.pdf;
-    try {
-      while (S.pdf === pdf && lg === S.loadGen && S.cur !== S.want) {
-        const t0 = performance.now();
-        let n = 0;
-        while (S.pdf === pdf && lg === S.loadGen && S.cur !== S.want) {
-          const d = Math.sign(S.want - S.cur);
-          for (let m = S.want; m !== S.cur; m -= d) { const q = S.pages[m - 1]; if (q && q.rendered) { n = m; break; } }   // 行き先に最も近い描画済みページ
-          if (n) break;
-          if (performance.now() - t0 > 1500) { n = S.want; break; }                                                         // 描画が遅い場合は、待ちすぎずに切り替える
-          await sleep(12);
-        }
-        if (!n) break;
-        const q = S.pages[n - 1];
-        if (!q.pageObj) await ensurePage(q);
-        if (S.pdf !== pdf || lg !== S.loadGen) break;
-        showNow(n, navWhere);
-        await sleep(16);
-      }
-    } catch (e) { console.warn('page switch', e); }
-  })();
-  pumpP = me;
-  me.finally(() => { if (pumpP === me) pumpP = null; });
-  return me;
+// ページ送りが止まったら、表示中のページを描き、前後を先読みする
+function flipSettle() {
+  clearTimeout(flipTimer);
+  flipTimer = setTimeout(() => {
+    if (performance.now() - RS.lastFlip < FLIP_SETTLE) { flipSettle(); return; }
+    if (!S.paged || !S.pdf) return;
+    const p = S.pages[S.cur - 1]; if (!p) return;
+    const n = S.cur;
+    ensurePage(p).then(() => { if (S.cur !== n) return; applyScale(p); renderPage(p); prefetch(n); }).catch(() => {});
+  }, FLIP_SETTLE);
 }
 async function showPage(n, where = 'top') {
   if (!S.pdf) return;
   n = clamp(n, 1, S.pdf.numPages);
   S.dirNav = Math.sign(n - S.cur) || S.dirNav;
-  S.want = n; navWhere = where; setKeep(n); updatePgBar();
-  const p = S.pages[n - 1];
-  ensurePage(p).then(() => renderPage(p)).catch(() => {});
-  prefetch(n);
-  return pump();
+  const now = performance.now(), fast = now - RS.lastFlip < FLIP_SETTLE; RS.lastFlip = now;
+  S.want = n; setKeep(n);
+  showNow(n, where, fast);
 }
 const atTop = () => wrap.scrollTop <= 1;
 const atBottom = () => wrap.scrollTop + wrap.clientHeight >= wrap.scrollHeight - 2;
 const edgeNow = (dir) => S.want !== S.cur || (dir > 0 ? atBottom() : atTop());
-/** 1ページ進む／戻る。表示が追いついていない（2ページ以上先行している）ときは何もしない（回し続けても詰まらないように） */
+/** 1ページ進む／戻る（描画を待たずに、すぐ切り替える） */
 function advance(dir) {
   if (!S.pdf) return false;
   const t = S.want + dir;
   if (t < 1 || t > S.pdf.numPages) return false;
-  if ((S.want - S.cur) * dir >= 2) return false;
   showPage(t, dir > 0 ? 'top' : 'bottom');
   return true;
 }
 let lastKeyFlip = 0;
 function keyFlip(dir) {
   const now = performance.now();
-  if (now - lastKeyFlip < 90) return;
+  if (now - lastKeyFlip < 25) return;
   if (advance(dir)) lastKeyFlip = now;
 }
 function pagedStep(dir, byKey = false, amount = 0) {
@@ -1527,16 +1813,127 @@ function applyGamma() {
 /* ---------------------------------------------------------------- 描画 */
 let lockTail = Promise.resolve();
 function withLock(fn) { const run = lockTail.then(fn, fn); lockTail = run.catch(() => {}); return run; }
-const io = new IntersectionObserver((es) => { for (const e of es) { const p = S.pages[+e.target.dataset.num - 1]; if (!p) continue; p.visible = e.isIntersecting; if (e.isIntersecting) renderPage(p); } }, { root: wrap, rootMargin: '500px 0px' });
+const io = new IntersectionObserver((es) => {
+  const flipping = S.paged && performance.now() - RS.lastFlip < FLIP_SETTLE;          // 1ページ表示でページ送りを続けている間は描かない（止まってから flipSettle が描く）
+  for (const e of es) { const p = S.pages[+e.target.dataset.num - 1]; if (!p) continue; p.visible = e.isIntersecting; if (e.isIntersecting && !flipping) renderPage(p); }
+}, { root: wrap, rootMargin: '500px 0px' });
 const ioFar = new IntersectionObserver((es) => { if (S.paged || S.zooming) return; for (const e of es) { const p = S.pages[+e.target.dataset.num - 1]; if (p && !e.isIntersecting && p.rendered) releasePage(p); } }, { root: wrap, rootMargin: '3000px 0px' });
+/* ---- 描画の順番と、スクロール中の描画の制御（v4.11.1: 大きなPDFでも滑らかにスクロールできるように）
+ *  ・描画を待っているページは、画面の中央に近い順に描く（通り過ぎたページの描画は待たない・取りやめる）
+ *  ・同時に描画を進めるのは2ページまで（1ページを描いている間に、次のページの内容をPDF.jsの作業スレッドで読み込む）
+ *  ・画面への描き込みは1フレームに1回分（約15ms）だけ。スクロール中は、さらに間隔をあけてスクロールを優先する
+ *  ・アンチエイリアスで大きく描くページは、先に普通の大きさで描いて表示し、スクロールが止まってから高画質で描き直す */
+const RS = { lastFlip: 0, fast: false, lastTop: 0, lastScroll: 0, lastSlice: 0, active: new Set(), queue: new Set(), waiting: new Map(), timer: 0, raf: 0, inflight: null, inflightAt: 0 };
+const MAX_ACTIVE = 2;
+window.__EPA_RS = RS;                         // 動作確認用
+const scrollingNow = () => performance.now() - RS.lastScroll < 140;
+/** 描画の優先度（小さいほど先）。描かなくてよいページは Infinity */
+function renderPrio(p) {
+  if (S.zooming || !pagedWanted(p)) return Infinity;
+  const up = p.rendered ? 1e7 : 0;                                         // 描き直し（高画質化・倍率の変更）は、まだ白いページの後
+  if (S.paged) return up + (p.num === S.want ? 0 : p.num === S.cur ? 1 : 2 + Math.abs(p.num - S.want));
+  const r = p.el.getBoundingClientRect(), w = wrap.getBoundingClientRect();
+  if (!r.height) return Infinity;
+  const mid = (w.top + w.bottom) / 2, d = Math.abs((r.top + r.bottom) / 2 - mid);
+  if (r.bottom > w.top && r.top < w.bottom) return up + d;                    // 画面に見えている
+  const gap = r.bottom <= w.top ? w.top - r.bottom : r.top - w.bottom;
+  if (gap > w.height) return Infinity;                                       // 1画面以上離れたページは描かない
+  return up + 1e5 + d;
+}
+/** 描画の順番を待つ。描かなくてよくなったら false */
+function renderSlot(p, gen) {
+  return new Promise((res) => { p.slotRes = res; p.slotGen = gen; RS.queue.add(p); slotPump(); });
+}
+function slotDone(p) { if (RS.active.delete(p)) slotPump(); }
+function slotPump() {
+  for (const q of RS.queue) if (q.slotGen !== q.gen || renderPrio(q) === Infinity) { RS.queue.delete(q); q.slotRes(false); }
+  const busy = scrollingNow() && !S.paged;
+  while (RS.active.size < MAX_ACTIVE && RS.queue.size) {
+    let best = null, bp = Infinity;
+    for (const q of RS.queue) { const v = renderPrio(q); if (v < bp) { bp = v; best = q; } }
+    if (!best || (busy && (bp >= 1e5 || RS.fast))) break;                      // スクロール中は、見えているページだけ始める（速いときは、止まるまで待つ）
+    // 優先度の高いページの読み込みが終わる（描き始める）までは、次のページを始めない（作業スレッドを、先に見せたいページに使う）
+    if ([...RS.active].some((q) => !q.drawing && renderPrio(q) < bp)) break;
+    RS.queue.delete(best); RS.active.add(best); best.slotRes(true);
+  }
+  if (RS.queue.size && busy) idleKick();
+}
+// スクロール中: 描画中のページのうち、遠く離れたものは取りやめる
+function dropFarRenders() {
+  if (S.paged) return;
+  for (const q of [...RS.active]) if (q.rendering && renderPrio(q) === Infinity) cancelRender(q);
+}
+/** 画面への描き込み（PDF.js の onContinue）: 1フレームに1回分。スクロール中は間隔をあける。優先度の高いページから */
+function drawGate(p, cont) {
+  RS.waiting.set(p, cont);
+  if (!p.drawing) { p.drawing = true; slotPump(); }                          // 読み込みが終わって描き始めた: 次のページの読み込みを始めてよい
+  drawPump();
+}
+function drawPump() {
+  if (!RS.waiting.size) return;
+  const now = performance.now();
+  if (scrollingNow() && !S.paged && now - RS.lastSlice < 60) { frameKick(); return; }
+  let best = null, bp = Infinity;
+  for (const q of RS.waiting.keys()) { const v = renderPrio(q); if (v < bp || !best) { bp = v; best = q; } }
+  if (bp === Infinity) {                                                      // 拡大縮小中などで、描かなくてよくなったページは描かずに取りやめる
+    for (const q of [...RS.waiting.keys()]) if (renderPrio(q) === Infinity) cancelRender(q);
+    return;
+  }
+  // 別のページの描き込みが進行中（PDF.js が次のフレームで描く予定）なら、それが終わるまで待つ（1フレームに2ページ分を描かない）
+  // 同じページの続きは待たない（v4.11.1: 1回分ごとに1フレーム空いて、描画が半分の速さになっていたのを修正）
+  if (RS.inflight && RS.inflight !== best && RS.inflight.rendering && now - RS.inflightAt < 40) { frameKick(); return; }
+  const cont = RS.waiting.get(best); RS.waiting.delete(best);
+  RS.inflight = best; RS.inflightAt = now; RS.lastSlice = now;
+  cont();
+  if (RS.waiting.size) frameKick();
+}
+function frameKick() {
+  if (RS.raf) return;
+  RS.raf = requestAnimationFrame(() => { RS.raf = 0; drawPump(); });
+}
+function idleKick() {
+  clearTimeout(RS.timer);
+  RS.timer = setTimeout(() => { if (scrollingNow()) { idleKick(); return; } requestNear(); slotPump(); drawPump(); upgradePending(); }, 150);
+}
+// スクロールが止まったとき: 画面の付近で、まだ描いていないページを描く（スクロール中に取りやめたページなど）
+function requestNear() {
+  if (S.paged || !S.pdf) return;
+  const c = S.cur - 1;
+  for (let i = Math.max(0, c - 3); i <= Math.min(S.pages.length - 1, c + 3); i++) {
+    const p = S.pages[i];
+    if ((!p.rendered || p.rscale !== p.scale) && !p.rendering && renderPrio(p) < Infinity) renderPage(p);
+  }
+}
+// スクロールが止まったら、普通の大きさで描いておいたページを高画質で描き直す
+function upgradePending() {
+  if (S.paged || S.zooming) return;
+  for (const p of S.pages) if (p.rquick && p.rendered && !p.rendering && renderPrio(p) < Infinity) { p.rscale = -1; renderPage(p); }
+}
+/** スクロールが止まってから実行する（選択用の文字層など、重い後処理） */
+function afterScroll(fn) {
+  const tick = () => {
+    if (scrollingNow() && !S.paged) { setTimeout(tick, 160); return; }
+    if (window.requestIdleCallback) requestIdleCallback(fn, { timeout: 600 }); else setTimeout(fn, 0);
+  };
+  tick();
+}
+wrap.addEventListener('scroll', () => {
+  if (S.paged) return;
+  const now = performance.now(), dt = Math.max(1, now - RS.lastScroll), dy = Math.abs(wrap.scrollTop - RS.lastTop);
+  RS.fast = dy / Math.min(dt, 100) > wrap.clientHeight / 400;          // 1画面を0.4秒より速く動かしている: 止まるまで描画を始めない
+  RS.lastScroll = now; RS.lastTop = wrap.scrollTop;
+  dropFarRenders(); idleKick();
+}, { passive: true });
 /** 描画を中止する（今の表示内容は残す） */
 function cancelRender(p) {
   p.gen++; try { p.task && p.task.cancel(); } catch { /* ignore */ }
   p.task = null; p.rendering = false; p.rp = null;
+  RS.waiting.delete(p); if (RS.queue.delete(p)) p.slotRes(false); slotDone(p);
 }
-/** 描画内容を捨てて、空の枠に戻す */
+/** 描画内容を捨てて、空の枠に戻す（PDF.js の、そのページの描画用データも手放す＝メモリを抑える） */
 function releasePage(p) {
-  cancelRender(p); p.svg = null; p.rendered = false; p.rscale = 0; p.el.replaceChildren();
+  cancelRender(p); p.svg = null; p.rendered = false; p.rscale = 0; p.rquick = false; p.el.replaceChildren();
+  if (p.pageObj) { try { p.pageObj.cleanup(); } catch { /* ignore */ } }
 }
 function pickSS(q, W, H) {
   let ss = 1;
@@ -1547,24 +1944,32 @@ function pickSS(q, W, H) {
 }
 const freeCanvas = (c) => { try { c.width = 0; c.height = 0; } catch { /* ignore */ } };
 /** テキストレイヤ（選択用）をブラウザー標準のPDFビューアの選択表示に近づける: ①ハイライトの高さを文字の高さに ②同じ行の隣り合う文字列の隙間をつなぐ */
-function tidyTextLayer(td) {
+// v4.11.1: 文字の多いページで画面が止まらないように、少しずつ（手が空いたときに約8msずつ）処理する
+async function tidyTextLayer(td) {
   const spans = [...td.children].filter((e) => e.tagName === 'SPAN');
   if (!spans.length || spans.length > 5000) return;
-  for (const s of spans) s.style.clipPath = 'inset(0)';
-  const rs = spans.map((s) => s.getBoundingClientRect());
-  const jobs = [];
-  for (let i = 0; i + 1 < spans.length; i++) {
-    const a = rs[i], b = rs[i + 1];
-    if (!a.height || !b.height || !spans[i].textContent) continue;
-    const h = a.height, gap = b.left - a.right;
-    if (Math.abs((a.top + a.bottom) / 2 - (b.top + b.bottom) / 2) < h * 0.4 && gap > 0.5 && gap < h * 2.2) jobs.push([spans[i], gap]);
+  const idle = () => new Promise((r) => (window.requestIdleCallback ? requestIdleCallback(r, { timeout: 500 }) : setTimeout(r, 0)));
+  const STEP = 200;
+  for (let st = 0; st < spans.length - 1; st += STEP) {
+    if (st) await idle();
+    if (!td.isConnected || S.zooming) return;
+    const part = spans.slice(st, Math.min(spans.length, st + STEP + 1));      // 次の塊の先頭も1つ含める（隙間を測るため）
+    for (const s of part) s.style.clipPath = 'inset(0)';
+    const rs = part.map((s) => s.getBoundingClientRect());
+    const jobs = [];
+    for (let i = 0; i + 1 < part.length; i++) {
+      const a = rs[i], b = rs[i + 1];
+      if (!a.height || !b.height || !part[i].textContent) continue;
+      const h = a.height, gap = b.left - a.right;
+      if (Math.abs((a.top + a.bottom) / 2 - (b.top + b.bottom) / 2) < h * 0.4 && gap > 0.5 && gap < h * 2.2) jobs.push([part[i], gap]);
+    }
+    const pads = jobs.map(([s]) => { const i = document.createElement('i'); i.textContent = ' '; i.style.cssText = 'font:inherit;color:transparent;white-space:pre'; s.appendChild(i); return i; });
+    const ws = pads.map((i) => i.getBoundingClientRect().width);
+    pads.forEach((i, n) => {
+      const s = jobs[n][0], tf = getComputedStyle(s).transform, k = (tf && tf !== 'none' && new DOMMatrixReadOnly(tf).a) || 1;
+      i.style.letterSpacing = Math.max(0, (jobs[n][1] - ws[n]) / k) + 'px';
+    });
   }
-  const pads = jobs.map(([s]) => { const i = document.createElement('i'); i.textContent = ' '; i.style.cssText = 'font:inherit;color:transparent;white-space:pre'; s.appendChild(i); return i; });
-  const ws = pads.map((i) => i.getBoundingClientRect().width);
-  pads.forEach((i, n) => {
-    const s = jobs[n][0], tf = getComputedStyle(s).transform, k = (tf && tf !== 'none' && new DOMMatrixReadOnly(tf).a) || 1;
-    i.style.letterSpacing = Math.max(0, (jobs[n][1] - ws[n]) / k) + 'px';
-  });
 }
 const pagedWanted = (p) => !S.paged || S.keep.has(p.num);
 /** ページを描画する。すでに最新なら何もしない。描画中は今の表示を残し、できあがってから丸ごと差し替える（途中で白くならない） */
@@ -1600,27 +2005,29 @@ async function doRender(p, gen) {
   try {
     if (!p.pageObj) p.pageObj = await pdf.getPage(p.num);
     if (gen !== p.gen || lg !== S.loadGen) return;
+    if (!(await renderSlot(p, gen))) { aborted = true; return; }             // 順番を待つ（待っている間に不要になったら描かない）
+    p.drawing = false;
+    if (gen !== p.gen) return;
     const sc = p.scale; p.rtarget = sc; p.rc++;
     const view = p.pageObj.getViewport({ scale: sc });
     const dpr = Math.min(window.devicePixelRatio || 1, Math.sqrt(16e6 / (view.width * view.height)));
     const canvas = document.createElement('canvas');
     canvas.width = Math.max(1, Math.floor(view.width * dpr)); canvas.height = Math.max(1, Math.floor(view.height * dpr));
     canvas.style.width = view.width + 'px'; canvas.style.height = view.height + 'px';
-    const ss = pickSS(sc * dpr, canvas.width, canvas.height);
+    let ss = pickSS(sc * dpr, canvas.width, canvas.height);
+    const quick = ss > 1 && !p.rendered && !S.paged;                        // まだ白いページ: まず普通の大きさで描いて早く見せる
+    if (quick) ss = 1;
     let target = canvas;
     if (ss > 1) { big = document.createElement('canvas'); big.width = canvas.width * ss; big.height = canvas.height * ss; target = big; }
     const sx = target.width / view.width, sy = target.height / view.height;
-    await withLock(async () => {
-      if (gen !== p.gen) return;
-      if (S.zooming || !pagedWanted(p)) { aborted = true; return; }          // 待っている間に不要になった描画は捨てる
-      globalThis.__EPA_MINW = 0;
-      const ctx = target.getContext('2d');
-      if (ss > 1) { ctx.fillStyle = '#fff'; ctx.fillRect(0, 0, target.width, target.height); }
-      ctx.textRendering = 'geometricPrecision';
-      p.task = p.pageObj.render({ canvasContext: ctx, viewport: view, transform: (sx !== 1 || sy !== 1) ? [sx, 0, 0, sy, 0, 0] : undefined });
-      await p.task.promise;
-    });
-    if (aborted || gen !== p.gen) return;
+    globalThis.__EPA_MINW = 0;
+    const ctx = target.getContext('2d');
+    if (ss > 1) { ctx.fillStyle = '#fff'; ctx.fillRect(0, 0, target.width, target.height); }
+    ctx.textRendering = 'geometricPrecision';
+    p.task = p.pageObj.render({ canvasContext: ctx, viewport: view, transform: (sx !== 1 || sy !== 1) ? [sx, 0, 0, sy, 0, 0] : undefined });
+    p.task.onContinue = (cont) => drawGate(p, cont);
+    await p.task.promise;
+    if (gen !== p.gen) return;
     if (big) {
       let cur = big;
       for (let k = ss; k > 1; k /= 2) {
@@ -1635,16 +2042,19 @@ async function doRender(p, gen) {
     svg.setAttribute('class', 'ov'); svg.setAttribute('width', view.width); svg.setAttribute('height', view.height);
     svg.setAttribute('viewBox', `0 0 ${view.width} ${view.height}`);
     // ---- 差し替え（一度に入れ替えるので、途中で白い画面が出ない）
-    p.view = view; p.svg = svg; p.rendered = true; p.rscale = sc;
+    p.view = view; p.svg = svg; p.rendered = true; p.rscale = sc; p.rquick = quick;
     p.el.style.width = view.width + 'px'; p.el.style.height = view.height + 'px'; p.el.style.setProperty('--scale-factor', sc);
     p.el.replaceChildren(canvas, td, svg);
     redrawPage(p);
     if (S.editing && S.editing.a.page === p.num && !S.editing.ta.isConnected) p.el.appendChild(S.editing.ta);
-    buildTextLayer(p, gen, view, sc);
+    if (!quick) afterScroll(() => { if (gen === p.gen && p.view === view) buildTextLayer(p, gen, view, sc); });
+    else idleKick();                                                            // 止まったら高画質で描き直す（文字層もそのとき作る）
   } catch (e) {
     if (e && e.name !== 'RenderingCancelledException') console.error(e);
   } finally {
     if (big) freeCanvas(big);
+    RS.waiting.delete(p); slotDone(p); drawPump();
+    if (aborted) { /* 順番待ちの間に不要になった */ }
   }
 }
 /* ------------------------------------------------------- SVGオーバーレイ */
@@ -1693,7 +2103,7 @@ function drawAnnot(p, a, parent, { draft = false } = {}) {
     const bb = annotBBox(a);
     if (a.type === 'text') {
       const g1 = svgEl('g', { transform: `matrix(${view.transform.join(' ')})` }, g);
-      const L = layoutText(a.text, a.p.fontSize, a.w), bw = a.p.width || 0;
+      const L = layoutText(a.text, a.p.fontSize, a.w, { face: a.p.face }), bw = a.p.width || 0, F = faceOf(a.p.face);
       const g2 = svgEl('g', { transform: `translate(${a.pts[0][0]} ${a.pts[0][1]}) rotate(${a.rot || 0}) scale(1 -1)` }, g1);
       if (a.p.fill) svgEl('rect', { x: 0, y: 0, width: a.w, height: L.h, fill: a.p.fill }, g2);
       if (bw > 0) svgEl('rect', { x: bw / 2, y: bw / 2, width: a.w - bw, height: L.h - bw, fill: 'none', stroke: a.p.color, 'stroke-width': bw }, g2);
@@ -1701,7 +2111,7 @@ function drawAnnot(p, a, parent, { draft = false } = {}) {
         for (const r of ln.runs) {
           if (r.t.trim() === '') continue;
           const t = svgEl('text', { x: r.x, y: L.pad + i * L.lh + L.b, fill: a.p.color, 'font-size': a.p.fontSize,
-            'font-family': r.f === 'l' ? FONT_LAT : FONT_JP, style: 'white-space:pre' }, g2);
+            'font-family': r.f === 'l' ? F.css.l : F.css.j, style: 'white-space:pre' }, g2);
           t.textContent = r.t;
         }
       });
@@ -1893,7 +2303,7 @@ function scaleAnnot(a, o, O, sx, sy) {
   if (a.type === 'text') {
     const k = sx === 1 ? sy : sy === 1 ? sx : Math.sqrt(sx * sy);
     a.pts = [f(o.pts[0])];
-    if (sy === 1) a.w = Math.max(10, o.w * sx);                     // 横の辺だけ: 幅だけ
+    if (sy === 1) { a.w = Math.max(10, o.w * sx); delete a.autoW; }                     // 横の辺だけ: 幅だけ
     else { a.p.fontSize = clamp(Math.round(o.p.fontSize * k * 10) / 10, 4, 300); a.w = Math.max(10, o.w * k); }
     return;
   }
@@ -2006,13 +2416,38 @@ async function deleteSelectedAnnots() {
   toast(`${keys.length}個の注釈を削除しました`);
 }
 const INKABLE = new Set(['line', 'rect', 'ellipse', 'polyline', 'polygon', 'cloud', 'ink']);
-/** 選択した図形の注釈を、1つの手書き（Ink）注釈にまとめる */
-function convertToInk() {
-  const all = selOurs(), conv = all.filter((a) => INKABLE.has(a.type));
-  if (!conv.length) { toast('手書き注釈に変換できる図形（直線・四角形・丸・折れ線・雲形・手書き）を選択してください'); return; }
-  const page = conv[0].page, list = conv.filter((a) => a.page === page);
-  const skipped = S.sel.size - list.length;
-  const strokes = [];
+// 手書き注釈にまとめられる組み合わせか（同じページに、図形が2つ以上。既存の図形の注釈も含む）
+function inkTargets() {
+  const items = [...selOurs().filter((a) => INKABLE.has(a.type)), ...selNatives().filter((n) => NATIVE_SHAPES.has(n.subtype))];
+  if (!items.length) return null;
+  const page = items[0].page, list = items.filter((x) => x.page === page);
+  return { page, ours: list.filter((x) => !x.key), nats: list.filter((x) => x.key), n: list.length };
+}
+const canMergeInk = () => { const t = inkTargets(); return !!t && t.n >= 2 && (!encLocked() || !t.nats.length) && S.lock.annot; };
+/** 選択した図形の注釈を、1つの手書き（Ink）注釈にまとめる（v4.11: 既存の図形の注釈もまとめられる） */
+async function convertToInk() {
+  if (S.busy) return;
+  const T = inkTargets();
+  if (!T || T.n < 2) { toast('手書き注釈にまとめるには、同じページの図形（直線・四角形・丸・折れ線・多角形・雲形・手書き）を2つ以上選択してください'); return; }
+  const { page } = T, list = T.ours;
+  const skipped = S.sel.size - T.n;
+  const strokes = [], sn = takeSnap();
+  if (T.nats.length) {                     // 既存の注釈を図形として読み、元のPDFからは削除する
+    setBusy(true, '既存の注釈をまとめています…');
+    try {
+      const doc = await baseDoc(), shapes = [];
+      for (const n of T.nats) { const d = doc.context.lookupMaybe(refFromId(n.id), PDFDict), sh = d && nativeShape(doc, d); if (sh) shapes.push(sh); }
+      for (const a of shapes) {
+        const op = (a.p.opacity ?? 100) / 100;
+        for (const pr of shapePrims(a)) {
+          const st = primStyle(a, pr);
+          strokes.push({ pts: flattenPrim(pr), closed: !!(pr.closed || pr.k === 'circle'), color: st.color, width: st.width, fill: pr.fill && st.fill ? st.fill : null, dash: st.dash, op: (st.op ?? 1) * op });
+        }
+      }
+      await setBase(await nativeEdit(T.nats.map((n) => ({ type: 'del', id: n.id, page: n.page }))));
+    } catch (e) { console.error(e); toast('既存の注釈をまとめられませんでした: ' + friendlyError(e), 6000); return; }
+    finally { setBusy(false); }
+  }
   for (const a of list) {
     const op = (a.p.opacity ?? 100) / 100;
     if (a.type === 'ink') { for (const st of a.strokes) strokes.push({ ...st, pts: st.pts.map((q) => q.slice()), op: (st.op ?? 1) * op }); continue; }
@@ -2021,16 +2456,16 @@ function convertToInk() {
       strokes.push({ pts: flattenPrim(pr), closed: !!(pr.closed || pr.k === 'circle'), color: st.color, width: st.width, fill: pr.fill && st.fill ? st.fill : null, dash: st.dash, op });
     }
   }
-  const snap = takeSnap();
-  const idx = S.annots.findIndex((a) => a === list[0]);
+  if (!strokes.length) return;
+  const idx = list.length ? S.annots.findIndex((a) => a === list[0]) : S.annots.length;
   const ink = { id: newId(), type: 'ink', page, pts: [], strokes, author: S.author, date: new Date().toISOString(),
     p: { ...DEFAULTS, color: strokes[0].color, width: strokes[0].width, opacity: 100 } };
   const dead = new Set(list.map((a) => a.id));
   S.annots = S.annots.filter((a) => !dead.has(a.id));
   S.annots.splice(Math.min(idx, S.annots.length), 0, ink);
   S.sel = new Set([ink.id]);
-  redrawPage(S.pages[page - 1]); commit(snap); syncProps(); updateButtons();
-  toast(`${list.length}個の図形を1つの手書き注釈にまとめました${skipped > 0 ? `（テキスト・スタンプ・既存の注釈・別ページの${skipped}個は対象外）` : ''}`, 5000);
+  redrawPage(S.pages[page - 1]); commit(sn); syncProps(); updateButtons();
+  toast(`${T.n}個の図形を1つの手書き注釈にまとめました${skipped > 0 ? `（テキスト・スタンプ・別ページなど${skipped}個は対象外）` : ''}`, 5000);
 }
 /* ------------------------------------------------------- 履歴 (undo / redo) */
 const takeSnap = () => ({ a: JSON.stringify(S.annots), b: S.baseBytes });
@@ -2064,6 +2499,25 @@ function updateButtons() {
   $('#btnUndo').disabled = !S.undo.length; $('#btnRedo').disabled = !S.redo.length;
   $('#btnDelete').disabled = !(S.sel.size || (S.tool === 'edit' && ce.sel.size));
   for (const id of ['#btnDocProps', '#btnPrint', '#btnEmbed', '#btnRotL', '#btnRotR', '#btnSave', '#btnSaveAs', '#btnStamp', '#btnDateStamp', '#btnDateStampCfg', '#btnPages', '#btnOrg']) $(id).disabled = !S.pdf;
+  // 編集ロック: 使えない機能はグレーアウトし、理由をツールチップに出す
+  const enc = !!S.pdf && encLocked(), noAnnot = !!S.pdf && !S.lock.annot, noPrint = !!S.pdf && !S.lock.print;
+  const lockEl = (el, off, why) => {
+    if (!el) return;
+    if (el.dataset.title0 === undefined) el.dataset.title0 = el.title || '';
+    if (off) el.disabled = true;
+    el.classList.toggle('locked', off);
+    el.title = off ? `${why}\n（左の「文書プロパティ」で編集ロックを解除すると使えます）` : el.dataset.title0;
+  };
+  const ENC = 'このPDFは編集ロック（暗号化）がかかっているため使えません', ANN = 'このPDFは文書の設定で注釈の追加が禁止されているため使えません';
+  document.querySelectorAll('.tool').forEach((b) => { b.disabled = false; });
+  for (const id of ['#bmAdd', '#bmRename', '#bmDel']) $(id).disabled = false;
+  for (const id of ['#btnRotL', '#btnRotR', '#btnPages', '#btnOrg', '#btnEmbed']) lockEl($(id), enc, ENC);
+  lockEl(document.querySelector('.tool[data-tool="edit"]'), enc, ENC);
+  document.querySelectorAll('.tool').forEach((b) => { if (!['select', 'asel', 'edit'].includes(b.dataset.tool)) lockEl(b, noAnnot, ANN); });
+  for (const id of ['#btnStamp', '#btnDateStamp', '#btnDateStampCfg']) lockEl($(id), noAnnot, ANN);
+  lockEl($('#btnPrint'), noPrint, 'このPDFは文書の設定で印刷が禁止されているため使えません');
+  for (const id of ['#bmAdd', '#bmRename', '#bmDel']) lockEl($(id), enc || !S.pdf, enc ? ENC : 'PDFを開いてください');
+  if (S.pdf && !enc) { $('#bmAdd').disabled = false; $('#bmRename').disabled = $('#bmDel').disabled = !S.bmSel; }
 }
 /* ------------------------------------------------------- 選択 / プロパティ */
 const selAnnot = () => S.annots.find((a) => a.id === S.selId) || null;
@@ -2081,7 +2535,7 @@ function select(id) {
 const curDefaults = () => (S.tool === 'text' ? S.textDefaults : S.defaults);
 const P = { start: $('#pStart'), end: $('#pEnd'), style: $('#pStyle'), width: $('#pWidth'), color: $('#pColor'), fill: $('#pFill'),
   opacity: $('#pOpacity'), opacityNum: $('#pOpacityNum'), font: $('#pFontSize'), intensity: $('#pCloud'), radius: $('#pRadius'),
-  startSize: $('#pStartSize'), endSize: $('#pEndSize') };
+  startSize: $('#pStartSize'), endSize: $('#pEndSize'), face: $('#pFontFace') };
 /** 始点・終点の大きさ欄: 「なし」のときは隠す */
 function syncEndSize(p) {
   P.startSize.value = p.startSize ?? 100; P.endSize.value = p.endSize ?? 100;
@@ -2093,7 +2547,7 @@ const CAPS = {
   line: ['start', 'end', 'style', 'width', 'color', 'fill', 'opacity'], polyline: ['start', 'end', 'style', 'width', 'color', 'fill', 'opacity', 'radius'],
   polygon: ['style', 'width', 'color', 'fill', 'opacity'],
   cloud: ['style', 'width', 'color', 'fill', 'opacity', 'intensity'], ink: ['width', 'color', 'opacity'],
-  rect: ['style', 'width', 'color', 'fill', 'opacity', 'radius'], ellipse: ['style', 'width', 'color', 'fill', 'opacity'], text: ['width', 'color', 'fill', 'opacity', 'font'],
+  rect: ['style', 'width', 'color', 'fill', 'opacity', 'radius'], ellipse: ['style', 'width', 'color', 'fill', 'opacity'], text: ['width', 'color', 'fill', 'opacity', 'font', 'face'],
   stamp: ['opacity'], native: [], none: ['start', 'end', 'style', 'width', 'color', 'fill', 'opacity'],
 };
 function syncZBox() { $('#zBox').style.display = (S.tool === 'edit' ? ce.sel.size : (isSelTool() && S.sel.size)) ? '' : 'none'; }
@@ -2104,8 +2558,9 @@ function syncProps() {
   if (S.tool === 'edit') { ceSyncProps(); return; }
   if (S.sel.size > 1) { syncMultiProps(); return; }
   const a = selAnnot(), nat = selNative();
+  if (nat) loadNativeProps([nat]);
   const kind = a ? a.type : nat ? 'native' : (S.tool === 'select' ? null : S.tool);
-  const p = a ? a.p : curDefaults();
+  const p = a ? a.p : nat ? { ...S.defaults, ...S.textDefaults, ...(nat.props || {}) } : curDefaults();
   let title;
   if (a) title = `選択中: ${OURS_LABEL[a.type]}`;
   else if (nat) title = `選択中: 既存の注釈（${NATIVE_LABEL[nat.subtype] || nat.subtype}）`;
@@ -2116,20 +2571,22 @@ function syncProps() {
   P.width.value = p.width; P.color.value = p.color;
   P.fill.value = p.fill || '#ffffff'; P.fill.classList.toggle('none', !p.fill);
   P.opacity.value = p.opacity; P.opacityNum.value = p.opacity;
-  P.font.value = p.fontSize || S.textDefaults.fontSize;
+  P.font.value = p.fontSize || S.textDefaults.fontSize; P.face.value = FACES[p.face] ? p.face : 'gothic';
   P.intensity.value = String(p.intensity || 1);
   P.radius.value = p.radius || 0;
-  const caps = new Set(CAPS[kind || 'none']);
+  const caps = new Set(nat ? (nat.props ? nativeCaps(nat) : []) : CAPS[kind || 'none']);
   $('#rowRadius').style.display = caps.has('radius') ? '' : 'none';
   for (const k of Object.keys(P)) P[k].disabled = !caps.has(k);
   P.opacityNum.disabled = !caps.has('opacity');
   $('#pFillNone').disabled = !caps.has('fill');
   syncEndSize(p);
-  $('#rowFont').style.display = kind === 'text' ? '' : 'none';
-  $('#rowCloud').style.display = kind === 'cloud' ? '' : 'none';
-  $('#lblColor').textContent = kind === 'text' ? '文字の色(O) :' : '色(O) :';
-  $('#lblWidth').textContent = kind === 'text' ? '枠線の太さ(T) :' : '太さ(T) :';
-  P.width.min = kind === 'text' ? '0' : '0.25';
+  const textLike = kind === 'text' || (nat && nat.subtype === 'FreeText');
+  $('#rowFont').style.display = kind === 'text' || caps.has('font') ? '' : 'none';
+  P.face.style.display = $('label[for="pFontFace"]').style.display = nat ? 'none' : '';    // 既存のテキストボックスの書体は変えられない
+  $('#rowCloud').style.display = kind === 'cloud' || caps.has('intensity') ? '' : 'none';
+  $('#lblColor').textContent = textLike ? '文字の色(O) :' : '色(O) :';
+  $('#lblWidth').textContent = textLike ? '枠線の太さ(T) :' : '太さ(T) :';
+  P.width.min = textLike ? '0' : '0.25';
   $('#natBox').style.display = nat ? '' : 'none';
   $('#hintEnds').textContent = nat
     ? (NATIVE_VERTEX.has(nat.subtype) ? `※ドラッグで移動／頂点のハンドルをドラッグで形を変更${nat.subtype === 'Line' ? '' : '・辺をダブルクリックで頂点を追加・Alt+クリックで頂点を削除'}／Enterで内容を編集`
@@ -2144,28 +2601,43 @@ function syncProps() {
 const CAPKEY = { fontSize: 'font', startSize: 'start', endSize: 'end' };
 function setAnnotProp(a, key, value) {
   a.p[key] = value;
+  if (a.type === 'text' && (key === 'fontSize' || key === 'face')) fitTextW(a);
   if (a.type === 'ink' && (key === 'color' || key === 'width')) a.strokes = a.strokes.map((st) => ({ ...st, [key]: value }));
 }
 function applyProp(key, value) {
   if (S.tool === 'edit') { if (ce.sel.size) ce.pend[key] = value; return; }
+  const cap = CAPKEY[key] || key;
   if (S.sel.size > 1) {
-    const list = selOurs().filter((a) => (CAPS[a.type] || []).includes(CAPKEY[key] || key)); if (!list.length) return;
+    pendNative(selNatives(), key, value);
+    const list = selOurs().filter((a) => (CAPS[a.type] || []).includes(cap)); if (!list.length) return;
     if (!S.propSnap) S.propSnap = takeSnap();
     for (const a of list) setAnnotProp(a, key, value);
     redrawAll(); S.dirty = true; return;
   }
-  const a = selAnnot();
+  const a = selAnnot(), nat = selNative();
   if (a) {
     if (!S.propSnap) S.propSnap = takeSnap();
     setAnnotProp(a, key, value); redrawPage(pageOf(a)); S.dirty = true;
-  } else if (!selNative()) curDefaults()[key] = value;
+  } else if (nat) pendNative([nat], key, value);
+  else curDefaults()[key] = value;
+}
+// 既存の注釈のプロパティの変更は、確定したとき（endPropEdit）にまとめてPDFに反映する（スライダーを動かしている間は貯めておく）
+function pendNative(list, key, value) {
+  const cap = CAPKEY[key] || key;
+  for (const n of list) {
+    if (!n.props || !nativeCaps(n).includes(cap) || (key === 'face')) continue;
+    if (!S.natPend) S.natPend = new Map();
+    const e = S.natPend.get(n.key) || { n, props: {} }; e.props[key] = value; n.props[key] = value; S.natPend.set(n.key, e);
+  }
 }
 /** 複数選択中のプロパティ欄 */
 function syncMultiProps() {
   const ours = selOurs(), nats = selNatives();
+  loadNativeProps(nats);
   $('#propTarget').textContent = `選択中: ${S.sel.size}個の注釈${nats.length ? `（既存${nats.length}個を含む）` : ''}`; $('#propTarget').classList.add('sel');
-  const caps = new Set(ours.flatMap((a) => CAPS[a.type] || []));
-  const p = (ours.find((a) => a.type !== 'stamp') || ours[0] || { p: S.defaults }).p;
+  const caps = new Set([...ours.flatMap((a) => CAPS[a.type] || []), ...nats.flatMap((n) => (n.props ? nativeCaps(n) : []))]);
+  const nat0 = nats.find((n) => n.props && nativeCaps(n).length);
+  const p = (ours.find((a) => a.type !== 'stamp') || ours[0] || { p: nat0 ? { ...S.defaults, ...nat0.props } : S.defaults }).p;
   P.start.value = p.start || 'None'; P.end.value = p.end || 'None'; P.style.value = p.style || 'solid';
   P.width.value = p.width ?? 1; P.color.value = p.color || '#000000';
   P.fill.value = p.fill || '#ffffff'; P.fill.classList.toggle('none', !p.fill);
@@ -2180,7 +2652,7 @@ function syncMultiProps() {
   $('#lblColor').textContent = '色(O) :'; $('#lblWidth').textContent = '太さ(T) :';
   $('#natBox').style.display = 'none';
   $('#multiBox').style.display = '';
-  $('#btnToInk').disabled = !ours.some((a) => INKABLE.has(a.type));
+  $('#btnToInk').disabled = !canMergeInk();
   $('#hintEnds').textContent = '※ドラッグでまとめて移動／上の丸いハンドルで回転（Shiftで15°刻み）／Deleteで削除／Shift+クリックで追加・解除／Ctrl+Gで1つの手書き注釈に';
 }
 // プロパティ欄での変更を確定し、元に戻す履歴に1回分として積む
@@ -2190,6 +2662,11 @@ function endPropEdit() {
     const cur = JSON.stringify(S.annots);
     if (cur !== S.propSnap.a) { S.undo.push(S.propSnap); S.redo = []; S.dirty = true; }
     S.propSnap = null; updateButtons(); scheduleList();
+  }
+  if (S.natPend && S.natPend.size) {
+    const ops = [...S.natPend.values()].map(({ n, props }) => ({ type: 'props', id: n.id, page: n.page, props }));
+    S.natPend = null;
+    nativeOp(ops, '既存の注釈を変更中…');
   }
 }
 const numIn = (el, lo, hi, dflt) => { const v = parseFloat(el.value); return Number.isFinite(v) ? clamp(v, lo, hi) : dflt; };
@@ -2216,6 +2693,7 @@ P.opacityNum.addEventListener('change', () => { const c = numIn(P.opacityNum, 0,
 P.font.addEventListener('input', () => { const v = parseFloat(P.font.value); if (Number.isFinite(v) && v >= 4) applyProp('fontSize', clamp(v, 4, 300)); });
 P.radius.addEventListener('input', () => { const v = parseFloat(P.radius.value); if (Number.isFinite(v) && v >= 0) applyProp('radius', clamp(v, 0, 500)); });
 P.radius.addEventListener('change', () => { applyProp('radius', numIn(P.radius, 0, 500, 0)); endPropEdit(); });
+P.face.addEventListener('change', () => { applyProp('face', P.face.value); endPropEdit(); });
 P.font.addEventListener('change', () => { applyProp('fontSize', numIn(P.font, 4, 300, 12)); if (S.tool !== 'edit') P.font.value = (selAnnot() || { p: curDefaults() }).p.fontSize; endPropEdit(); });
 /* ------------------------------------------------------------ 追加 / 削除 */
 function addAnnot(a, opts = {}) {
@@ -2230,9 +2708,10 @@ function addAnnot(a, opts = {}) {
 }
 async function nativeOp(op, msg, { keepSel = true } = {}) {
   if (S.busy) return false;
+  if (encLocked()) { toast('このPDFは編集ロック（暗号化）がかかっているため、既存の注釈やしおりは変更できません。左の「文書プロパティ」でロックを解除できます。', 6000); return false; }
   const sn = takeSnap(), sel = new Set(S.sel); setBusy(true, msg);
   try {
-    const bytes = await nativeEdit([op]);
+    const bytes = await nativeEdit(Array.isArray(op) ? op : [op]);
     S.sel = keepSel ? sel : new Set();
     await setBase(bytes); commit(sn); return true;
   } catch (e) { console.error(e); toast('操作できませんでした: ' + friendlyError(e), 6000); redrawAll(); return false; }
@@ -2268,6 +2747,8 @@ async function deleteByKey(key) {
 const deleteSelected = () => (S.tool === 'edit' ? ceDelete() : S.sel.size ? deleteSelectedAnnots() : undefined);
 /* ------------------------------------------------------------ ツール */
 function setTool(t) {
+  const tb = document.querySelector(`.tool[data-tool="${t}"]`);
+  if (tb && tb.disabled && S.pdf) { toast(tb.title.split('\n')[0], 4000); return; }      // 編集ロックで使えないツール（キー操作で選ばれた場合も）
   if (S.draft) finishPoly();
   if (S.editing) endEdit(true);
   const prev = S.tool;
@@ -2456,11 +2937,11 @@ window.addEventListener('pointermove', (e) => {
       redrawPage(p);
     } else if (d.mode === 'handle') {
       const a = d.a; const pt = toPdf(p, xy);
-      if (a.type === 'text' && d.idx === 0) { const v = rotPt(pt, a.pts[0], -(a.rot || 0)); a.w = Math.max(20, v[0] - a.pts[0][0]); }
+      if (a.type === 'text' && d.idx === 0) { const v = rotPt(pt, a.pts[0], -(a.rot || 0)); a.w = Math.max(20, v[0] - a.pts[0][0]); delete a.autoW; }
       else if (a.type === 'text' && d.idx >= 5) {   // 辺: 左=幅（右辺を固定）、上下=拡大縮小（反対側の辺を固定）
         const o = d.origA, rot = o.rot || 0, lb = localBox(o), anc = o.pts[0], v = rotPt(pt, anc, -rot), h0 = lb[3] - lb[1];
         if (d.idx === 5) {
-          const w2 = Math.max(20, lb[2] - v[0]); a.w = w2; a.pts = [rotPt([lb[2] - w2, lb[3]], anc, rot)];
+          const w2 = Math.max(20, lb[2] - v[0]); a.w = w2; delete a.autoW; a.pts = [rotPt([lb[2] - w2, lb[3]], anc, rot)];
         } else {
           const h2 = d.idx === 6 ? v[1] - lb[1] : lb[3] - v[1];
           const k = clamp(h2 / Math.max(h0, 1e-6), 4 / o.p.fontSize, 300 / o.p.fontSize);
@@ -2541,9 +3022,10 @@ window.addEventListener('pointerup', () => {
     const [a, b] = g.pts, moved = Math.hypot(a[0] - b[0], a[1] - b[1]) > 8;
     // 枠の左上（画面上）を基点にする。ページが回転していても、画面で見て横書きになるよう注釈を回す
     const tl = moved ? [Math.min(a[0], b[0]), Math.min(a[1], b[1])] : a;
+    // クリックだけで置いたときは幅を自動にする（入力した文字のいちばん長い行に合わせて右の余白を詰める）
     const w = moved ? Math.max(30, Math.abs(a[0] - b[0]) / d.p.view.scale) : 200;
     const r = normRot(d.p.view.rotation);
-    beginEdit({ id: newId(), type: 'text', page: d.p.num, pts: [toPdf(d.p, tl)], w, ...(r ? { rot: r } : {}), text: '', author: S.author, date: new Date().toISOString(), p: { ...S.textDefaults } }, true);
+    beginEdit({ id: newId(), type: 'text', page: d.p.num, pts: [toPdf(d.p, tl)], w, ...(moved ? {} : { autoW: true }), ...(r ? { rot: r } : {}), text: '', author: S.author, date: new Date().toISOString(), p: { ...S.textDefaults } }, true);
   } else if (d.mode === 'move' && d.toggle && JSON.stringify(d.a.pts) === JSON.stringify(d.orig)) { toggleSel(d.toggle);
   } else if (d.mode === 'gscale') { finishGroupScale(d);
   } else if (d.mode === 'gmove') { finishGroupMove(d);
@@ -2605,16 +3087,34 @@ function finishPoly() {
 }
 function cancelDraft() { if (!S.draft) return; const p = S.pages[S.draft.page - 1]; S.draft = null; S.drag = null; redrawPage(p); }
 /* ------------------------------------------------- テキストコメントの編集 */
+// 幅が自動のテキスト: 置いた位置からページの右端（画面で見た右）までを折り返しの上限にする
+function autoMaxW(p, a) {
+  const [vx] = vpt(p.view, a.pts[0]);
+  return Math.max(30, (p.view.width - vx) / p.view.scale - 4);
+}
+// 幅が自動のテキストの幅を、いちばん長い行に合わせる（上限は autoMaxW）
+function fitTextW(a, p = pageOf(a)) {
+  if (!a || a.type !== 'text' || !a.autoW || !p || !p.view) return;
+  const maxW = autoMaxW(p, a), L = layoutText(a.text || '', a.p.fontSize, maxW, { face: a.p.face });
+  a.w = Math.min(maxW, Math.max(a.p.fontSize, L.maxLineW + L.pad * 2 + 1));
+}
 function beginEdit(a, isNew) {
   const p = pageOf(a); if (!p || !p.view) return;
   if (S.editing) endEdit(true);
   const snap = takeSnap(), sc = p.view.scale, [vx, vy] = vpt(p.view, a.pts[0]);
+  if (a.autoW) a.w = autoMaxW(p, a);
   const ta = document.createElement('textarea'); ta.className = 'te'; ta.value = a.text || '';
-  Object.assign(ta.style, { left: vx + 'px', top: vy + 'px', width: a.w * sc + 'px', fontSize: a.p.fontSize * sc + 'px', fontFamily: FONT_STACK,
+  Object.assign(ta.style, { left: vx + 'px', top: vy + 'px', width: a.w * sc + 'px', fontSize: a.p.fontSize * sc + 'px', fontFamily: `${faceOf(a.p.face).css.l},${faceOf(a.p.face).css.j}`,
     padding: 2 * sc + 'px', color: a.p.color, background: a.p.fill || 'rgba(255,255,255,.88)', transform: `rotate(${p.view.rotation - (a.rot || 0)}deg)`, transformOrigin: '0 0' });
   p.el.appendChild(ta);
   S.editing = { a, isNew, ta, orig: a.text || '', snap };
-  const grow = () => { ta.style.height = 'auto'; ta.style.height = Math.max(ta.scrollHeight, a.p.fontSize * sc * 1.5) + 'px'; };
+  const grow = () => {
+    if (a.autoW) {         // 入力に合わせて編集欄の幅も伸ばす（右端までで折り返す）
+      const maxW = autoMaxW(p, a), L = layoutText(ta.value, a.p.fontSize, maxW, { face: a.p.face });
+      ta.style.width = Math.min(maxW, Math.max(a.p.fontSize * 4, L.maxLineW + L.pad * 2 + a.p.fontSize)) * sc + 'px';
+    }
+    ta.style.height = 'auto'; ta.style.height = Math.max(ta.scrollHeight, a.p.fontSize * sc * 1.5) + 'px';
+  };
   ta.addEventListener('input', grow);
   ta.addEventListener('blur', () => endEdit(true));
   ta.addEventListener('keydown', (e) => {
@@ -2630,14 +3130,14 @@ function endEdit(commitIt = true) {
   S.editing = null;
   const text = E.ta.value; if (E.ta.isConnected) E.ta.remove();
   const a = E.a, p = pageOf(a);
-  if (!commitIt) { if (p) redrawPage(p); return; }
+  if (!commitIt) { fitTextW(a, p); if (p) redrawPage(p); return; }
   if (E.isNew) {
     if (text.trim() === '') { if (p) redrawPage(p); return; }
-    a.text = text; addAnnot(a);
+    a.text = text; fitTextW(a, p); addAnnot(a);
   } else {
-    if (text === E.orig) { if (p) redrawPage(p); return; }
+    if (text === E.orig) { fitTextW(a, p); if (p) redrawPage(p); return; }
     if (text.trim() === '') { S.annots = S.annots.filter((x) => x.id !== a.id); S.sel.delete(a.id); }
-    else a.text = text;
+    else { a.text = text; fitTextW(a, p); }
     if (p) redrawPage(p); commit(E.snap); syncProps();
   }
 }
@@ -3142,7 +3642,7 @@ function ceMove(dx, dy) { const ids = [...ce.sel]; if (ids.length) return ceComm
 /* ---- 入りと出 */
 async function ceEnter() {
   if (!S.pdf) return;
-  if (S.libErr) { toast('このPDFは編集ロック（セキュリティ設定）がかかっているため、内容の編集ができません。左の「文書プロパティ」でロックを解除できます。', 7000); setTool('select'); return; }
+  if (encLocked()) { toast('このPDFは編集ロック（セキュリティ設定）がかかっているため、内容の編集ができません。左の「文書プロパティ」でロックを解除できます。', 7000); setTool('select'); return; }
   const n = S.cur;
   $('#propTarget').textContent = '文字・図形を読み取り中…';
   const pr = await ceParse(n);
@@ -3438,6 +3938,7 @@ window.addEventListener('keydown', (e) => {
   if (mod && e.key.toLowerCase() === 'o') { e.preventDefault(); openFileDialog(); return; }
   if (mod && e.key.toLowerCase() === 'p') { e.preventDefault(); printDoc(); return; }
   if (typing) return;
+  if (mod && e.key.toLowerCase() === 'b' && S.pdf && !S.busy) { e.preventDefault(); if (encLocked()) toast('このPDFは編集ロックがかかっているため、しおりを追加できません。', 5000); else bmAdd(); return; }
   if (mod && e.key.toLowerCase() === 'z') { e.preventDefault(); e.shiftKey ? redo() : undo(); return; }
   if (mod && e.key.toLowerCase() === 'y') { e.preventDefault(); redo(); return; }
   if (mod && (e.key === '+' || e.key === '=')) { e.preventDefault(); stepZoom(S.scale * 1.15); return; }
@@ -3558,7 +4059,7 @@ async function downloadBytes(bytes, filename, { saveAs = false } = {}) {
 function showError(title, e) {
   const msg = friendlyError(e), raw = (e && (e.stack || e.message)) || String(e);
   return dialog({ title, ok: 'OK',
-    html: `<p style="white-space:pre-wrap">${esc(msg)}</p><details open><summary>詳細（開発者への連絡用）</summary><textarea readonly rows="6" style="width:480px;max-width:80vw">${esc(`${e && e.name ? e.name + ': ' : ''}${(e && e.message) || ''}\n${raw}\nv4.10 / ${navigator.userAgent}`)}</textarea></details>` });
+    html: `<p style="white-space:pre-wrap">${esc(msg)}</p><details open><summary>詳細（開発者への連絡用）</summary><textarea readonly rows="6" style="width:480px;max-width:80vw">${esc(`${e && e.name ? e.name + ': ' : ''}${(e && e.message) || ''}\n${raw}\nv4.11 / ${navigator.userAgent}`)}</textarea></details>` });
 }
 // 保存（上書き／名前を付けて保存）。可能ならファイルに直接書き込み、できなければダウンロードにする
 // file:// のURL → PCのパス（Windows: C:\...、共有フォルダ: \\サーバー\...、それ以外: /...）
@@ -3818,8 +4319,8 @@ wrap.addEventListener('wheel', (e) => {
   if (!wheelSt.armed) return;
   wheelSt.acc = Math.min(wheelSt.acc + Math.abs(dy), 200);
   if (now < wheelSt.until || wheelSt.acc < 60) return;
-  if (!advance(dir)) return;                                             // 表示が追いつくまで待つ（回した分は無駄にならず、追いついた直後に次へ進む）
-  wheelSt.acc = 0; wheelSt.until = now + 60;
+  if (!advance(dir)) return;                                             // ホイール1ノッチで1ページ（回し続ければ、描画を待たずに次々と送る）
+  wheelSt.acc = 0; wheelSt.until = now + 12;
   wheelSt.armed = fitPaged();
 }, { passive: false });
 let rz; window.addEventListener('resize', () => { clearTimeout(rz); rz = setTimeout(() => { if (!S.pdf) return; if (['width', 'page', 'height'].includes(S.fit)) setZoom(S.fit); else updatePgBar(); }, 200); });
@@ -3939,12 +4440,149 @@ $('#cmtFilter').addEventListener('change', scheduleList);
 $('#author').value = S.author;
 $('#author').addEventListener('change', (e) => { S.author = e.target.value.trim(); LS.set('author', S.author); toast('作成者名を保存しました（以後の新規コメントに付きます）'); });
 function showTab(name) {
-  $('#propsPane').hidden = name !== 'props'; $('#listPane').hidden = name !== 'list';
-  $('#tabProps').classList.toggle('on', name === 'props'); $('#tabList').classList.toggle('on', name === 'list');
+  $('#propsPane').hidden = name !== 'props'; $('#listPane').hidden = name !== 'list'; $('#bmPane').hidden = name !== 'bm';
+  $('#tabProps').classList.toggle('on', name === 'props'); $('#tabList').classList.toggle('on', name === 'list'); $('#tabBm').classList.toggle('on', name === 'bm');
   if (name === 'list') renderList();
+  if (name === 'bm') renderBookmarks();
 }
 $('#tabProps').addEventListener('click', () => showTab('props'));
 $('#tabList').addEventListener('click', () => showTab('list'));
+$('#tabBm').addEventListener('click', () => showTab('bm'));
+/* ------------------------------------------------------- しおり（v4.11.1） */
+const bmClosed = new Set();            // 閉じているしおり（パスの文字列）
+// PDFのしおりを読み込む（PDF.js）。行き先のページ番号と、ページ内の位置（上端）も求める
+async function collectOutline() {
+  const pdf = S.pdf; if (!pdf) return;
+  let raw = null;
+  try { raw = await pdf.getOutline(); } catch (e) { console.warn('outline', e); }
+  const dest = async (it) => {
+    try {
+      let d = it.dest; if (typeof d === 'string') d = await pdf.getDestination(d);
+      if (!Array.isArray(d) || !d[0]) return null;
+      const idx = typeof d[0] === 'number' ? d[0] : await pdf.getPageIndex(d[0]);
+      const kind = d[1] && d[1].name, top = kind === 'XYZ' ? d[3] : kind === 'FitH' || kind === 'FitBH' ? d[2] : null;
+      return { page: idx + 1, top: typeof top === 'number' ? top : null };
+    } catch { return null; }
+  };
+  const walk = async (items, path) => {
+    const out = [];
+    for (let i = 0; i < (items || []).length; i++) {
+      const it = items[i], p = [...path, i], d = await dest(it);
+      out.push({ title: it.title || '（無題）', path: p, page: d ? d.page : null, top: d ? d.top : null, url: it.url || it.unsafeUrl || null,
+        bold: !!it.bold, italic: !!it.italic, items: await walk(it.items, p) });
+      if (!path.length && pdf !== S.pdf) return out;
+    }
+    return out;
+  };
+  const tree = await walk(raw, []);
+  if (pdf !== S.pdf) return;
+  if (S.outlineGen !== S.loadGen) { bmClosed.clear(); S.bmSel = null; S.outlineGen = S.loadGen; }     // 別のPDFを開いた
+  S.outline = tree;
+  if (S.bmSel && !bmFind(S.bmSel)) S.bmSel = null;
+  if (!$('#bmPane').hidden) renderBookmarks();
+  updateButtons();
+}
+const bmKey = (path) => path.join('.');
+function bmFind(key, list = S.outline) {
+  for (const it of list) { if (bmKey(it.path) === key) return it; const f = bmFind(key, it.items); if (f) return f; }
+  return null;
+}
+function renderBookmarks() {
+  const ul = $('#bmTree'); ul.replaceChildren();
+  const build = (items, parent) => {
+    for (const it of items) {
+      const li = document.createElement('li'), key = bmKey(it.path), has = it.items.length > 0;
+      li.setAttribute('role', 'treeitem');
+      if (has && bmClosed.has(key)) li.classList.add('closed');
+      const row = document.createElement('div'); row.className = 'bm' + (S.bmSel === key ? ' sel' : ''); row.dataset.key = key;
+      row.title = it.page ? `${it.title}（${it.page}ページ）` : it.url ? `${it.title}（${it.url}）` : it.title;
+      const tw = document.createElement('span'); tw.className = 'tw'; tw.textContent = has ? (bmClosed.has(key) ? '▶' : '▼') : '';
+      const tt = document.createElement('span'); tt.className = 'tt'; tt.textContent = it.title;
+      if (it.bold) tt.style.fontWeight = '600'; if (it.italic) tt.style.fontStyle = 'italic';
+      const pn = document.createElement('span'); pn.className = 'pn'; pn.textContent = it.page ? String(it.page) : it.url ? '🔗' : '';
+      row.append(tw, tt, pn); li.appendChild(row);
+      if (has) { const sub = document.createElement('ul'); sub.setAttribute('role', 'group'); build(it.items, sub); li.appendChild(sub); }
+      parent.appendChild(li);
+    }
+  };
+  build(S.outline, ul);
+  $('#bmEmpty').hidden = S.outline.length > 0;
+  updateButtons();
+}
+// しおりの行き先へ移動する（ページ内の位置があれば、その位置が画面の上に来るように）
+function bmGo(it) {
+  if (!it || !it.page || !S.pdf) return;
+  const n = clamp(it.page, 1, S.pdf.numPages), p = S.pages[n - 1];
+  const toTop = () => {
+    if (it.top == null || !p.pageObj) return;
+    const vy = p.pageObj.getViewport({ scale: p.scale }).convertToViewportPoint(0, it.top)[1];
+    wrap.scrollTop = (S.paged ? 0 : p.el.offsetTop) + Math.max(0, vy - 4);
+  };
+  if (S.paged) { showPage(n, 'top'); ensurePage(p).then(toTop).catch(() => {}); }
+  else { goPage(n); ensurePage(p).then(toTop).catch(() => {}); }
+}
+// 今、画面の一番上に見えている位置（ページ番号と、ページ内の上端のPDF座標）
+function viewTopDest() {
+  const n = S.cur, p = S.pages[n - 1]; if (!p) return { page: 1, top: null };
+  const view = p.view || (p.pageObj ? p.pageObj.getViewport({ scale: p.scale }) : null);
+  const y = Math.max(0, wrap.getBoundingClientRect().top - p.el.getBoundingClientRect().top);
+  if (!view || y < 2) return { page: n, top: view ? view.convertToPdfPoint(0, 0)[1] : null };
+  return { page: n, top: view.convertToPdfPoint(0, y)[1] };
+}
+async function bmAdd() {
+  if (!S.pdf || S.busy) return;
+  if (S.editing) endEdit(true);
+  const d = viewTopDest();
+  const r = await dialog({
+    title: 'しおりを追加', ok: '追加',
+    html: `<label>しおりの名前 <input id="bmName" value="${esc(d.page + 'ページ')}" style="width:100%"></label><p class="small">${d.page}ページの、今見えている位置に付けます。${S.bmSel ? '選んでいるしおりの下に追加します。' : ''}</p>`,
+    init: (dl) => { const i = dl.querySelector('#bmName'); setTimeout(() => { i.focus(); i.select(); }, 0); },
+    validate: (dl) => { const v = dl.querySelector('#bmName').value.trim(); if (!v) throw new Error('名前を入力してください。'); return v; },
+  });
+  if (!r) return;
+  const path = S.bmSel ? S.bmSel.split('.').map(Number) : null;
+  const ok = await nativeOp({ type: 'bm', act: 'add', path, title: r, page: d.page, top: d.top }, 'しおりを追加中…');
+  if (ok) {
+    S.bmSel = path ? bmKey([...path.slice(0, -1), path[path.length - 1] + 1]) : bmKey([S.outline.length]);
+    showTab('bm'); toast(`しおり「${r}」を追加しました（保存すると、ファイルに反映されます）`);
+  }
+}
+async function bmRename() {
+  const it = S.bmSel && bmFind(S.bmSel); if (!it || S.busy) return;
+  const r = await dialog({
+    title: 'しおりの名前を変更', ok: '変更',
+    html: `<label>しおりの名前 <input id="bmName" value="${esc(it.title)}" style="width:100%"></label>`,
+    init: (dl) => { const i = dl.querySelector('#bmName'); setTimeout(() => { i.focus(); i.select(); }, 0); },
+    validate: (dl) => { const v = dl.querySelector('#bmName').value.trim(); if (!v) throw new Error('名前を入力してください。'); return v; },
+  });
+  if (!r || r === it.title) return;
+  await nativeOp({ type: 'bm', act: 'rename', path: it.path, title: r }, 'しおりの名前を変更中…');
+}
+async function bmDelete() {
+  const it = S.bmSel && bmFind(S.bmSel); if (!it || S.busy) return;
+  const n = (function cnt(x) { return x.items.reduce((a, c) => a + 1 + cnt(c), 0); })(it);
+  if (n && !(await dialog({ title: 'しおりの削除', ok: '削除', html: `<p>「${esc(it.title)}」と、その下の${n}個のしおりを削除します。</p>` }))) return;
+  if (await nativeOp({ type: 'bm', act: 'del', path: it.path }, 'しおりを削除中…')) { S.bmSel = null; toast(`しおり「${it.title}」を削除しました`); }
+}
+$('#bmTree').addEventListener('click', (e) => {
+  const row = e.target.closest('.bm'); if (!row) return;
+  const key = row.dataset.key, it = bmFind(key);
+  if (e.target.classList.contains('tw') && it && it.items.length) {                       // ▶▼: 開く／閉じる
+    if (bmClosed.has(key)) bmClosed.delete(key); else bmClosed.add(key);
+    renderBookmarks(); return;
+  }
+  S.bmSel = key; renderBookmarks(); bmGo(it);
+});
+$('#bmTree').addEventListener('dblclick', (e) => { const row = e.target.closest('.bm'); if (row && !e.target.classList.contains('tw') && !encLocked()) { S.bmSel = row.dataset.key; bmRename(); } });
+$('#bmPane').addEventListener('keydown', (e) => {
+  if ((e.target.tagName || '').toLowerCase() === 'input') return;
+  if (e.key === 'F2' && S.bmSel && !encLocked()) { e.preventDefault(); e.stopPropagation(); bmRename(); }
+  else if (e.key === 'Delete' && S.bmSel && !encLocked()) { e.preventDefault(); e.stopPropagation(); bmDelete(); }
+});
+$('#bmTree').tabIndex = 0;
+$('#bmAdd').addEventListener('click', bmAdd);
+$('#bmRename').addEventListener('click', bmRename);
+$('#bmDel').addEventListener('click', bmDelete);
 $('#btnComments').addEventListener('click', () => { $('#props').classList.remove('hidden'); showTab('list'); });
 /* ------------------------------------------------------- ダイアログ */
 function dialog({ title, html, ok = 'OK', init, validate }) {
@@ -4030,23 +4668,27 @@ async function applyItems(items, msg = 'ページを処理中…') {
   finally { setBusy(false); }
 }
 // 選んだページだけを新しいPDFとして書き出す（ページの抽出）
+// ページ（items）だけの新しいPDFを作る。'old' は srcBytes（今の注釈を入れたPDF）のページ
+async function itemsToBytes(items, srcBytes) {
+  const src = await PDFDocument.load(srcBytes, { updateMetadata: false });
+  const out = await PDFDocument.create(), extDocs = new Map();
+  for (const it of items) {
+    let page;
+    if (it.k === 'old') [page] = await out.copyPages(src, [it.i]);
+    else {
+      let ed = extDocs.get(it.ext);
+      if (!ed) { ed = await PDFDocument.load(it.ext.bytes, { updateMetadata: false }); extDocs.set(it.ext, ed); }
+      [page] = await out.copyPages(ed, [it.i]);
+    }
+    if (it.rot) page.setRotation(degrees((((page.getRotation().angle + it.rot) % 360) + 360) % 360));
+    out.addPage(page);
+  }
+  return await out.save({ useObjectStreams: false });
+}
 async function exportItems(items, srcBytes, nameSuffix) {
   setBusy(true, '抽出したPDFを作成中…');
   try {
-    const src = await PDFDocument.load(srcBytes, { updateMetadata: false });
-    const out = await PDFDocument.create(), extDocs = new Map();
-    for (const it of items) {
-      let page;
-      if (it.k === 'old') [page] = await out.copyPages(src, [it.i]);
-      else {
-        let ed = extDocs.get(it.ext);
-        if (!ed) { ed = await PDFDocument.load(it.ext.bytes, { updateMetadata: false }); extDocs.set(it.ext, ed); }
-        [page] = await out.copyPages(ed, [it.i]);
-      }
-      if (it.rot) page.setRotation(degrees((((page.getRotation().angle + it.rot) % 360) + 360) % 360));
-      out.addPage(page);
-    }
-    const bytes = await out.save({ useObjectStreams: false });
+    const bytes = await itemsToBytes(items, srcBytes);
     setBusy(false);
     const suggested = `${S.fileName.replace(/\.pdf$/i, '')}${nameSuffix}.pdf`;
     let name = null;
@@ -4141,18 +4783,19 @@ function orgRender() {
   org.items.forEach((it, idx) => {
     const el = document.createElement('div');
     el.className = 'thumb' + (org.sel.has(it.id) ? ' sel' : ''); el.dataset.id = it.id; el.draggable = true;
-    el.innerHTML = `<div class="tbox"><canvas></canvas></div><div class="tlab">${idx + 1}${it.k === 'ext' ? ' <span class="ext" title="挿入されたページ">＋挿入</span>' : ''}${it.rot ? ` <span class="rot">↻${it.rot}°</span>` : ''}</div>`;
+    el.innerHTML = `<div class="tbox"><canvas></canvas></div><div class="tlab">${idx + 1}${it.k === 'ext' ? ` <span class="ext" title="${esc(it.ext.name)}">＋${it.ext.tag || '挿入'}</span>` : ''}${it.rot ? ` <span class="rot">↻${it.rot}°</span>` : ''}</div>`;
     orgGrid.appendChild(el); thumbIO.observe(el);
   });
   orgInfo();
 }
-function orgInfo() { $('#orgInfo').textContent = `${org.items.length}ページ ／ 選択 ${org.sel.size}`; }
+function orgInfo() { $('#orgInfo').textContent = `${org.items.length}ページ ／ 選択 ${org.sel.size}`; orgSyncButtons(); }
 function orgRefreshSel() { orgGrid.querySelectorAll('.thumb').forEach((el) => el.classList.toggle('sel', org.sel.has(el.dataset.id))); orgInfo(); }
 function openOrganizer() {
   if (!S.pdf || S.busy) return;
+  if (encLocked()) { toast('このPDFは編集ロックがかかっているため、ページの整理はできません。左の「文書プロパティ」でロックを解除できます。', 6000); return; }
   if (S.editing) endEdit(true);
   org.items = currentItems(); org.sel.clear(); org.anchor = null; org.dragIds = null; org.open = true;
-  $('#org').classList.remove('hidden'); orgRender();
+  $('#org').classList.remove('hidden'); orgRender(); orgLoadClip();
 }
 function closeOrganizer() { org.open = false; $('#org').classList.add('hidden'); thumbIO.disconnect(); orgGrid.replaceChildren(); }
 const orgSelItems = () => org.items.filter((x) => org.sel.has(x.id));
@@ -4222,6 +4865,65 @@ async function orgInsert(file, idx) {
     org.items.splice(r.index, 0, ...items); org.sel = new Set(items.map((x) => x.id)); orgRender();
   } catch (e) { console.error(e); toast(e.message || String(e), 6000); }
 }
+// ---- ページのコピー・貼り付け（v4.11）
+//  コピーしたページは、注釈を含めた1つのPDFにして IndexedDB に置く。同じブラウザで開いている、ほかのタブのPDFの「ページの整理」からも貼り付けられる
+//  （拡張機能のページはすべて同じ保存場所を使う。コピーしたことは localStorage の変化で、ほかのタブに知らせる）
+const PAGECLIP_KEY = 'pageClip', PAGECLIP_LS = 'epa-pageclip';
+async function orgCopy() {
+  const sel = orgSelItems(); if (!sel.length) { toast('コピーするページを選択してください'); return; }
+  if (S.busy) return;
+  setBusy(true, 'ページをコピー中…');
+  try {
+    const bytes = await itemsToBytes(sel, await buildPdfBytes());
+    const clip = { bytes, n: sel.length, name: S.fileName || 'PDF', time: Date.now() };
+    await IDB.set(PAGECLIP_KEY, clip); org.clip = clip;
+    try { localStorage.setItem(PAGECLIP_LS, String(clip.time)); } catch { /* ignore */ }
+    orgSyncButtons();
+    toast(`${sel.length}ページをコピーしました（ほかのタブのPDFの「ページの整理」でも貼り付けられます）`, 3500);
+  } catch (e) { console.error(e); toast('コピーできませんでした: ' + friendlyError(e), 6000); }
+  finally { setBusy(false); }
+}
+async function orgLoadClip() {
+  const c = await IDB.get(PAGECLIP_KEY);
+  org.clip = c && c.bytes && c.n ? c : null; orgSyncButtons();
+  return org.clip;
+}
+// 貼り付ける位置: 選択したページの最後の後ろ（選択がなければ末尾）
+function orgInsertIndex() {
+  const sel = org.items.map((x, i) => (org.sel.has(x.id) ? i : -1)).filter((i) => i >= 0);
+  return sel.length ? sel[sel.length - 1] + 1 : org.items.length;
+}
+async function orgPaste() {
+  const c = await orgLoadClip(); if (!c) { toast('コピーしたページがありません（「ページの整理」でページを選んで「コピー」してください）'); return; }
+  const bytes = c.bytes instanceof Uint8Array ? c.bytes : new Uint8Array(c.bytes);
+  const ext = { name: `${c.name} からコピー`, bytes, n: c.n, pdfP: null, tag: '貼付' };
+  const idx = orgInsertIndex(), items = [];
+  for (let i = 0; i < c.n; i++) items.push({ id: newId(), k: 'ext', ext, i, rot: 0 });
+  org.items.splice(idx, 0, ...items); org.sel = new Set(items.map((x) => x.id)); org.anchor = items[0].id; orgRender();
+  toast(`${c.n}ページを貼り付けました（「適用」で反映されます）`);
+}
+// 空白ページを挿入する。大きさ・向きは、選択したページ（なければ最後のページ）の見た目に合わせる
+async function orgBlank() {
+  try {
+    const idx = orgInsertIndex(), ref = org.items[Math.max(0, idx - 1)];
+    let w = 595.28, h = 841.89;
+    if (ref) {
+      const doc = ref.k === 'old' ? S.pdf : await extPdf(ref.ext), page = await doc.getPage(ref.i + 1);
+      const v = page.getViewport({ scale: 1, rotation: (((page.rotate + ref.rot) % 360) + 360) % 360 });
+      w = v.width; h = v.height;
+    }
+    const bd = await PDFDocument.create(); bd.addPage([w, h]);
+    const ext = { name: '空白ページ', bytes: await bd.save(), n: 1, pdfP: null, tag: '空白' };
+    const it = { id: newId(), k: 'ext', ext, i: 0, rot: 0 };
+    org.items.splice(idx, 0, it); org.sel = new Set([it.id]); org.anchor = it.id; orgRender();
+  } catch (e) { console.error(e); toast('空白ページを挿入できませんでした: ' + friendlyError(e), 6000); }
+}
+function orgSyncButtons() {
+  $('#orgCopy').disabled = !org.sel.size;
+  $('#orgPaste').disabled = !org.clip;
+  $('#orgPaste').title = org.clip ? `コピーした${org.clip.n}ページ（${org.clip.name}）を、選択したページの後ろに貼り付け (Ctrl+V)` : 'コピーしたページはありません';
+}
+window.addEventListener('storage', (e) => { if (e.key === PAGECLIP_LS && org.open) orgLoadClip(); });
 function orgRotate(d) {
   const sel = orgSelItems(); if (!sel.length) { toast('回転するページを選択してください'); return; }
   sel.forEach((it) => { it.rot = (((it.rot + d) % 360) + 360) % 360; });
@@ -4251,12 +4953,17 @@ function orgKey(e) {
   if (e.key === 'Escape') { e.preventDefault(); closeOrganizer(); }
   else if (e.key === 'Delete' || e.key === 'Backspace') { e.preventDefault(); orgDelete(); }
   else if (mod && e.key.toLowerCase() === 'a') { e.preventDefault(); org.sel = new Set(org.items.map((x) => x.id)); orgRefreshSel(); }
+  else if (mod && e.key.toLowerCase() === 'c') { e.preventDefault(); orgCopy(); }
+  else if (mod && e.key.toLowerCase() === 'v') { e.preventDefault(); orgPaste(); }
 }
 $('#orgRotL').addEventListener('click', () => orgRotate(-90));
 $('#orgRotR').addEventListener('click', () => orgRotate(90));
 $('#orgDel').addEventListener('click', orgDelete);
 $('#orgExtract').addEventListener('click', orgExtract);
 $('#orgInsert').addEventListener('click', () => orgInsert(null, null));
+$('#orgCopy').addEventListener('click', orgCopy);
+$('#orgPaste').addEventListener('click', orgPaste);
+$('#orgBlank').addEventListener('click', orgBlank);
 $('#orgAll').addEventListener('click', () => { org.sel = new Set(org.items.map((x) => x.id)); orgRefreshSel(); });
 $('#orgApply').addEventListener('click', () => orgApply());
 $('#orgCancel').addEventListener('click', closeOrganizer);
@@ -4307,7 +5014,7 @@ $('#chkPin').addEventListener('change', (e) => LS.set('pin', e.target.checked));
 // 表示中のページを90度回転する（上のバーの回転ボタン）
 async function rotateCurPage(d) {
   if (!S.pdf || S.busy) return;
-  if (S.libErr) { toast('このPDFは編集ロックがかかっているため、ページを回転できません。左の「文書プロパティ」でロックを解除できます。', 6000); return; }
+  if (encLocked()) { toast('このPDFは編集ロックがかかっているため、ページを回転できません。左の「文書プロパティ」でロックを解除できます。', 6000); return; }
   const n = S.cur, items = currentItems(); items[n - 1].rot = d;
   if (await applyItems(items, 'ページを回転中…')) { goPage(n); toast(`${n}ページ目を${d < 0 ? '左' : '右'}に90°回転しました`); }
 }
@@ -4504,7 +5211,7 @@ function printMatrix(cx, cy, cw, ch, rot, L) {
 const pnum = (v) => { const r = Math.round(v * 10000) / 10000; return Object.is(r, -0) ? '0' : String(r); };
 // 印刷のもとにするPDF（追加した注釈を含む・暗号化を外したもの）
 async function printSourceBytes() {
-  if (S.libErr) {      // 暗号化されたPDF: 印刷用のコピーだけ暗号化を外し、追加した注釈を書き込む
+  if (encLocked()) {      // 暗号化されたPDF: 印刷用のコピーだけ暗号化を外し、追加した注釈を書き込む
     const r = await UNLOCK.unlock(S.baseBytes, '', { asUser: true });
     if (r.bytes) return S.annots.length ? await buildViaPdfLib(r.bytes) : r.bytes;
   }
@@ -4616,7 +5323,9 @@ async function printAsImages(bytes) {
       const cv = document.createElement('canvas'); cv.width = Math.floor(vp.width); cv.height = Math.floor(vp.height);
       const c2 = cv.getContext('2d'); c2.fillStyle = '#fff'; c2.fillRect(0, 0, cv.width, cv.height);
       globalThis.__EPA_MINW = 0;
-      await page.render({ canvasContext: c2, viewport: vp, intent: 'print', annotationMode: pdfjsLib.AnnotationMode.DISABLE }).promise;
+      globalThis.__EPA_MESHMAX = 9e6;                       // 印刷: グラデーション（メッシュ）を細かく描く（画面表示では軽くするため 1e6 画素まで）
+      try { await page.render({ canvasContext: c2, viewport: vp, intent: 'print', annotationMode: pdfjsLib.AnnotationMode.DISABLE }).promise; }
+      finally { globalThis.__EPA_MESHMAX = 0; }
       const blob = await new Promise((res) => cv.toBlob(res, 'image/jpeg', 0.92));
       freeCanvas(cv);
       const url = URL.createObjectURL(blob); urls.push(url);
@@ -4803,7 +5512,7 @@ $('#btnPrint').addEventListener('click', printDoc);
 async function embedAnnots() {
   if (!S.pdf || S.busy) return;
   if (S.editing) endEdit(true);
-  if (S.libErr) { toast('このPDFは編集ロックがかかっているため、注釈を埋め込めません。左の「文書プロパティ」でロックを解除できます。', 6000); return; }
+  if (encLocked()) { toast('このPDFは編集ロックがかかっているため、注釈を埋め込めません。左の「文書プロパティ」でロックを解除できます。', 6000); return; }
   const cur = S.cur;
   const res = await dialog({
     title: '注釈埋め込み', ok: '埋め込む',

@@ -117,6 +117,7 @@
     <div class="tabs">
       <button id="tabProps" type="button" class="on">プロパティ</button>
       <button id="tabList" type="button">コメント <span id="cmtCount" class="badge">0</span></button>
+      <button id="tabBm" type="button">しおり</button>
     </div>
     <section id="propsPane">
       <div id="propTarget" class="target">新規描画の既定値</div>
@@ -161,6 +162,8 @@
       <div id="rowFont" class="opac" style="display:none">
         <label for="pFontSize">フォントサイズ :</label>
         <div class="num"><input id="pFontSize" type="number" min="4" max="300" step="1" value="12"><span>ポイント</span></div>
+        <label for="pFontFace">フォント :</label>
+        <select id="pFontFace" style="width:100%;height:28px"><option value="gothic">ゴシック</option><option value="mincho">明朝</option><option value="mono">等幅（Courier＋ゴシック）</option></select>
       </div>
       <div id="rowCloud" class="opac" style="display:none">
         <label for="pCloud">雲の大きさ（うねり） :</label>
@@ -208,15 +211,16 @@
           <li>PCに保存したPDFを開くと、自動でこのエディターで開きます（インターネット上のPDFは扱いません）。ツールバーのアイコンからも開けます</li>
           <li>保存: ダイアログなしで保存します。保存先が分かっていれば上書き、無ければダウンロードフォルダ（同名は上書き）。別の場所へは「名前を付けて保存」</li>
           <li>雲形(C): クリックで頂点を追加、ダブルクリック/Enter/Escで閉じて確定、Backspaceで1点戻る。ドラッグすると四角形の雲になります。選択すると頂点をドラッグして形を変えられます（ダブルクリックで頂点追加／Alt+クリックで削除）</li>
-          <li>ページの整理: 左サイドバーの「ページの整理」。サムネイルをダブルクリックすると、変更を反映してそのページを開きます</li>
+          <li>しおり: 右のパネルの「しおり」タブ。クリックでその位置へ移動。「＋ しおりを追加」(Ctrl+B) で、今見えている位置にしおりを付けます。名前の変更（ダブルクリック・F2）・削除もできます</li>
+          <li>ページの整理: 左サイドバーの「ページの整理」。サムネイルをダブルクリックすると、変更を反映してそのページを開きます。「コピー」「貼り付け」で、同じブラウザのほかのタブで開いているPDFとの間でもページをコピーできます。「空白ページ」で、選択したページと同じ大きさの白紙を挿入します</li>
           <li>丸・楕円(E): ドラッグで楕円、Shiftを押しながらで正円。選択すると四角のハンドルで大きさを変えられます</li>
           <li>Shift: 直線・折れ線は45°刻み、四角形は正方形、丸・楕円は正円</li>
           <li>折れ線・多角形: クリックで頂点追加／ダブルクリック・Enter・Escで確定／Backspaceで1点戻る</li>
           <li>頂点の編集: 折れ線・多角形・雲形・直線（Acrobat などで作ったものも）を選ぶと頂点にハンドルが出ます。ドラッグで移動、辺をダブルクリックで頂点を追加、Alt+クリックで頂点を削除</li>
-          <li>テキスト(T): クリックで配置、ドラッグで幅を指定。Ctrl+Enter・Esc・画面のクリックで確定。選択すると四隅のハンドルで拡大縮小（フォントサイズも変わる）、右辺の中央で幅を変更</li>
+          <li>テキスト(T): クリックで配置（幅は入力した文字のいちばん長い行に自動で合わせる）、ドラッグで幅を指定。フォント（ゴシック・明朝・等幅）は右のプロパティ欄で選べます。Ctrl+Enter・Esc・画面のクリックで確定。選択すると四隅のハンドルで拡大縮小（フォントサイズも変わる）、右辺の中央で幅を変更</li>
           <li>画像スタンプ: 画像をコピーしてCtrl+V（画像ファイルのドロップも可）。角のハンドルで拡大縮小</li>
           <li>日付印: 左サイドバーの「日付印」で貼り付け、⚙で部名・日付・名前などを設定</li>
-          <li>既存のコメント: クリックで選択 → ドラッグで移動／角のハンドルでサイズ変更／ダブルクリックまたはEnterで内容を編集／Deleteで削除</li>
+          <li>既存のコメント: クリックで選択 → ドラッグで移動／角のハンドルでサイズ変更／ダブルクリックまたはEnterで内容を編集／Deleteで削除。色・塗り・太さ・線の種類・不透明度・線端・文字の大きさは、右のプロパティ欄で変えられます（種類によって変えられる項目が違います）。図形はほかの図形と一緒に「1つの手書き注釈にまとめる」こともできます</li>
           <li>矢印キー: 1pt移動（Shiftで10pt）</li>
         </ul>
       </details>
@@ -235,6 +239,14 @@
       <label class="author">作成者名 <input id="author" type="text" placeholder="（空欄なら作成者なし）"></label>
       <div id="listScroll"><ul id="cmtList"></ul><p id="cmtEmpty" class="small">コメントはありません</p></div>
     </section>
+    <section id="bmPane" hidden>
+      <div class="bm-bar">
+        <button id="bmAdd" type="button" class="pri-btn" title="表示中の位置に、しおりを追加 (Ctrl+B)。しおりを選んでいるときは、その下に追加します">＋ しおりを追加</button>
+        <button id="bmRename" type="button" title="選んだしおりの名前を変更 (F2・ダブルクリック)">名前を変更</button>
+        <button id="bmDel" type="button" title="選んだしおりを削除（下の階層のしおりも削除）">削除</button>
+      </div>
+      <div id="bmScroll"><ul id="bmTree" role="tree"></ul><p id="bmEmpty" class="small">しおりはありません。「＋ しおりを追加」で、表示中の位置にしおりを付けられます。</p></div>
+    </section>
   </aside>
 </main>
 
@@ -245,6 +257,9 @@
     <button id="orgRotR" type="button" title="選択ページを右に回転">⟳ 右回転</button>
     <button id="orgDel" type="button" title="選択ページを削除 (Delete)">削除</button>
     <button id="orgExtract" type="button" title="選択ページを別のPDFとして保存">抽出…</button>
+    <button id="orgCopy" type="button" title="選択ページをコピー (Ctrl+C)。ほかのタブで開いているPDFの「ページの整理」にも貼り付けられます">コピー</button>
+    <button id="orgPaste" type="button" title="コピーしたページを、選択したページの後ろに貼り付け (Ctrl+V)">貼り付け</button>
+    <button id="orgBlank" type="button" title="選択したページの後ろに、同じ大きさの空白ページを挿入">空白ページ</button>
     <button id="orgInsert" type="button" title="別のPDFのページを挿入（サムネイルへのドロップも可）">PDFから挿入…</button>
     <button id="orgAll" type="button">すべて選択</button>
     <span id="orgInfo" class="small"></span>
@@ -252,7 +267,7 @@
     <button id="orgApply" type="button" class="pri">適用</button>
     <button id="orgCancel" type="button">キャンセル</button>
   </div>
-  <div class="org-note">ドラッグで並べ替え／Ctrl・Shiftで複数選択／ダブルクリックで、変更を反映してそのページを開く／PDFファイルをドロップするとその位置に挿入</div>
+  <div class="org-note">ドラッグで並べ替え／Ctrl・Shiftで複数選択／Ctrl+Cでコピー・Ctrl+Vで選択ページの後ろに貼り付け（ほかのタブのPDFからも可）／ダブルクリックで、変更を反映してそのページを開く／PDFファイルをドロップするとその位置に挿入</div>
   <div id="orgGrid"></div>
 </div>
 

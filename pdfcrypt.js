@@ -331,10 +331,41 @@ export function createPdfUnlocker(PDFLib) {
     const doc = await PDFDocument.load(await new PDFDocument(ctx, true, false).save({ useObjectStreams: false }), { updateMetadata: false });
     return { bytes: await doc.save({ useObjectStreams: false }), enc: { R: enc.R, method: enc.stm } };
   }
+  /* 暗号化の情報だけを、文書全体を解析せずに読む（v4.11.1: 大きなPDFで「文書プロパティ」の表示が遅かったため）
+   *  末尾（と先頭）のトレーラーから /Encrypt と /ID を探し、暗号化の辞書のオブジェクトだけを取り出して、小さなPDFとして解析する。
+   *  読み取れないときは null（呼び出し側で、従来どおり文書全体を解析する） */
+  const latin1 = (u8) => { let t = ''; for (let i = 0; i < u8.length; i += 8192) t += String.fromCharCode.apply(null, u8.subarray(i, i + 8192)); return t; };
+  async function readEncryptionFast(bytes) {
+    const n = bytes.length, tail = latin1(bytes.subarray(Math.max(0, n - 2e6))), head = latin1(bytes.subarray(0, Math.min(n, 1e6)));
+    const lastOf = (txt, re) => { let m, r = null; re.lastIndex = 0; while ((m = re.exec(txt))) r = m; return r; };
+    const encRe = /\/Encrypt\s+(\d+)\s+(\d+)\s+R/g, idRe = /\/ID\s*\[\s*<([0-9A-Fa-f\s]*)>/g;
+    const em = lastOf(tail, encRe) || lastOf(head, encRe);
+    if (!em) return /\/Encrypt\b/.test(tail) || /\/Encrypt\b/.test(head) ? undefined : null;   // 直接書かれた辞書などは、従来の方法で読む
+    const idm = lastOf(tail, idRe) || lastOf(head, idRe);
+    if (!idm) return undefined;
+    // 暗号化の辞書のオブジェクト（"N G obj"）を、ファイルの中から探す（最後のものが有効）
+    const pat = new TextEncoder().encode(`${em[1]} ${em[2]} obj`), L = pat.length;
+    let pos = -1;
+    for (let i = bytes.lastIndexOf(0x6f); i >= L - 3; i = bytes.lastIndexOf(0x6f, i - 1)) {     // 'o'（"obj" の先頭）を手がかりに、後ろから探す（最後のものが有効）
+      if (bytes[i + 1] !== 0x62 || bytes[i + 2] !== 0x6a) continue;
+      const st = i - (L - 3);
+      let ok = st === 0 || bytes[st - 1] <= 0x20;
+      for (let k = 0; ok && k < L - 3; k++) if (bytes[st + k] !== pat[k]) ok = false;
+      if (ok) { pos = st; break; }
+    }
+    if (pos < 0) return undefined;
+    const body = latin1(bytes.subarray(pos, Math.min(n, pos + 65536)));
+    const end = body.indexOf('endobj'); if (end < 0) return undefined;
+    const mini = `%PDF-1.7\n${body.slice(0, end + 6)}\ntrailer\n<< /Encrypt ${em[1]} ${em[2]} R /ID [<${idm[1].replace(/\s+/g, '')}><${idm[1].replace(/\s+/g, '')}>] >>\n%%EOF\n`;
+    const u8 = new Uint8Array(mini.length); for (let i = 0; i < mini.length; i++) u8[i] = mini.charCodeAt(i) & 255;
+    return await readEncryption(u8);
+  }
   /** 暗号化されているか・方式（表示用） */
   async function info(bytes) {
     try {
-      const enc = await readEncryption(bytes);
+      let enc;
+      try { enc = await readEncryptionFast(bytes); } catch { enc = undefined; }
+      if (enc === undefined) enc = await readEncryption(bytes);
       if (!enc) return null;
       const label = enc.stm === 'AES256' ? 'AES 256ビット' : enc.stm === 'AES128' ? 'AES 128ビット' : enc.stm === 'RC4' ? `RC4 ${enc.n * 8}ビット` : '暗号化なし（Identity）';
       return { R: enc.R, label, P: enc.P };

@@ -61,6 +61,8 @@ body.paged .pg{margin:0 auto}
 /* 1ページ表示: 表示していないページは、画面の外に置いたまま描画を済ませておく（先読み）。切り替え時に白い画面が出ない */
 .pg.off{position:absolute;left:-200000px;top:0;margin:0!important;visibility:hidden;pointer-events:none}
 .pg canvas{position:absolute;inset:0;display:block}
+/* まだ描いていないページ（v4.11.1） */
+.pg:not(:has(> canvas))::before{content:'レンダリング中…';position:absolute;left:0;right:0;top:50%;transform:translateY(-50%);text-align:center;color:#8a8f98;font-size:13px;pointer-events:none}
 body.gam .pg canvas{filter:url(#epaGamma)}
 .pg .textLayer{position:absolute;inset:0}
 .textLayer ::selection,.textLayer span::selection,.textLayer i::selection{background:rgba(0,100,162,.4);color:transparent}
@@ -280,3 +282,21 @@ iframe.printFrame{position:fixed;right:0;bottom:0;width:2px;height:2px;border:0;
 .sv-btn{display:flex;gap:8px;align-items:center}
 .sv-btn button{min-width:84px;padding:6px 14px;border-radius:16px}
 #svYes:focus-visible,#svYes:focus{outline:2px solid #0f6cbd;outline-offset:2px}
+
+/* 編集ロックで使えない機能（v4.11.1） */
+button.locked,.tool.locked{opacity:.4;cursor:not-allowed}
+/* しおり（v4.11.1） */
+.bm-bar{display:flex;gap:6px;flex-wrap:wrap;margin-bottom:8px}
+.bm-bar .pri-btn{flex:1 1 100%;margin:0}
+.bm-bar button:not(.pri-btn){flex:1;height:28px}
+#bmScroll{max-height:calc(100vh - 170px);overflow:auto;border:1px solid #e1e1e1;border-radius:4px;padding:4px}
+#bmEmpty{margin:6px}
+#bmTree,#bmTree ul{list-style:none;margin:0;padding:0}
+#bmTree ul{padding-left:16px}
+#bmTree .bm{display:flex;align-items:flex-start;gap:2px;padding:3px 4px;border-radius:4px;cursor:pointer;line-height:1.35}
+#bmTree .bm:hover{background:#eef3fb}
+#bmTree .bm.sel{background:#dce8fb}
+#bmTree .tw{flex:0 0 16px;width:16px;text-align:center;color:#666;font-size:10px;line-height:18px;user-select:none}
+#bmTree .tt{flex:1;min-width:0;word-break:break-all}
+#bmTree .pn{flex:0 0 auto;color:#888;font-size:11px;padding-left:6px}
+#bmTree li.closed>ul{display:none}

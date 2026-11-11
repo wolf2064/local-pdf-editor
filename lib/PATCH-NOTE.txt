@@ -1,7 +1,20 @@
-pdf.min.mjs は PDF.js (Apache-2.0, https://github.com/mozilla/pdf.js) の pdfjs-dist 5.4.296 を、次の2か所だけ改変したものです。
+pdf.min.mjs と pdf.worker.min.mjs は PDF.js (Apache-2.0, https://github.com/mozilla/pdf.js) の pdfjs-dist 5.4.296 を、次の箇所だけ改変したものです。
+
+pdf.min.mjs（表示）
 1. CanvasGraphics.getScaleForStroking(): 「デバイスピクセルより細い線を、必ず1ピクセル幅に広げる」処理の下限値 1 を
    globalThis.__EPA_MINW に置き換え。viewer.js が 0 を設定し、細線は実寸（補正なし）で描かれます。
 2. TilingPattern.getPattern(): タイリングパターン（繰り返し模様の塗り）のタイル画像を、同じページの描画命令ごとにキャッシュして再利用
    （色・変換行列・タイルの大きさ・描画先の大きさが同じときだけ）。網掛けなどが多いページの描画を速くします。
    globalThis.__EPA_PCACHE = false でキャッシュを無効にできます。
+3. MeshShadingPattern._createMeshCanvas()（v4.11.1）: メッシュのグラデーション（シェーディング型4〜7）の画像を、
+   ・同じページの描画中は、同じ大きさなら作り直さずに再利用（グラデーションで塗った文字が多いと、文字ごとに作り直していた）
+   ・画像の大きさを globalThis.__EPA_MESHMAX 画素（未設定なら 100万画素）までに抑える（なめらかな色の変化なので見た目はほぼ同じ）。
+     印刷では viewer.js が 900万画素（PDF.js の元の上限と同じ）に設定します。
+
+pdf.worker.min.mjs（PDFの読み込み。v4.11.1）
+4. PartialEvaluator.loadFont(): ページごとに別のフォント辞書でも、同じ埋め込みフォント（FontFile）・同じ設定
+   （フォント記述子・BaseFont・文字幅・エンコーディング・ToUnicode など）なら、変換済みのフォントを使い回す（__epaFontKey）。
+5. Font（CFF形式の埋め込みフォント）: フォントの解析・変換の結果を、フォントの中身（ハッシュ）ごとに最大48個まで保持して使い回す（__epaCFF）。
+   カタログなど、ページごとにフォントを埋め込み直しているPDFで、ページの読み込みが速くなります。
+
 他の処理は変更していません。ライセンスは lib/LICENSE-pdfjs.txt を参照してください。
