@@ -598,7 +598,7 @@ async function addAnnotToPage(doc, page, a, cache) {
   arr.push(ref);
 }
 async function buildViaPdfLib(base = S.baseBytes) {
-  const doc = await PDFDocument.load(base, { updateMetadata: false });
+  const doc = await PDFDocument.load(await baseAll(base), { updateMetadata: false });
   await writeAnnots(doc, S.annots);
   return await doc.save({ useObjectStreams: false });
 }
@@ -673,12 +673,12 @@ async function buildViaPdfJs() {
       const key = `pdfjs_internal_editor_epa${Date.now().toString(36)}${n++}`; keys.push(key);
       st.setValue(key, { annotationType: 13, bitmapId: key + '_img', bitmap: bmp, pageIndex: a.page - 1, rect, rotation: 0, isSvg: false, structTreeParentId: null });
     }
-    if (!keys.length) return S.baseBytes.slice();
+    if (!keys.length) return (await baseAll()).slice();
     return new Uint8Array(await S.pdf.saveDocument());
   } finally { for (const k of keys) { try { st.remove(k); } catch { /* ignore */ } } }
 }
 async function buildPdfBytes() {
-  if (!S.annots.length) return S.baseBytes.slice();
+  if (!S.annots.length) return (await baseAll()).slice();
   try { return await buildViaPdfLib(); }
   catch (e) {
     console.warn('pdf-lib での保存に失敗。PDF.js の追記保存を試します', e);
@@ -1097,7 +1097,7 @@ function nativeCaps(n) {
 }
 // 元のPDF（S.baseBytes）を pdf-lib で読んだもの。読むだけに使う（変更しない）。元のPDFが変わったら読み直す
 function baseDoc() {
-  if (!S.baseDoc || S.baseDoc.bytes !== S.baseBytes) S.baseDoc = { bytes: S.baseBytes, p: PDFDocument.load(S.baseBytes, { updateMetadata: false }) };
+  if (!S.baseDoc || S.baseDoc.bytes !== S.baseBytes) S.baseDoc = { bytes: S.baseBytes, p: baseAll().then((b) => PDFDocument.load(b, { updateMetadata: false })) };
   return S.baseDoc.p;
 }
 // 選択中の既存の注釈の、プロパティの値を読む（まだ読んでいないものだけ）。読み終えたらプロパティ欄を更新する
@@ -1202,7 +1202,7 @@ function outlineEdit(doc, op) {
 }
 // PDFにもともとあった注釈（コメント）の変更・削除・配置順の変更を、元のPDFに直接反映する
 async function nativeEdit(ops) {
-  const doc = await PDFDocument.load(S.baseBytes, { updateMetadata: false });
+  const doc = await PDFDocument.load(await baseAll(), { updateMetadata: false });
   const ctx = doc.context, pages = doc.getPages(), N = (k) => PDFName.of(k);
   const mapFlat = (arr, fn) => {
     if (!(arr instanceof PDFArray)) return arr;
@@ -1321,7 +1321,7 @@ const encLocked = () => !!(S.lock.enc || S.libErr);
 async function refreshLock() {
   const pdf = S.pdf, bytes = S.baseBytes; if (!pdf || !bytes) return;
   let enc = null, perms = null;
-  try { enc = await UNLOCK.info(bytes); } catch { /* ignore */ }
+  try { enc = await lockInfo(bytes); } catch { /* ignore */ }
   try { perms = await pdf.getPermissions(); } catch { /* ignore */ }
   if (pdf !== S.pdf) return;
   S.lock = { enc: !!(enc && !enc.error), annot: !perms || perms.includes(0x20), print: !perms || perms.includes(0x04) };
@@ -1358,10 +1358,93 @@ function showMsg(html, err = false) {
   msgEl.className = 'msg' + (err ? ' err' : ''); msgEl.innerHTML = html; msgEl.style.display = 'flex';
   const b = msgEl.querySelector('button'); if (b) b.addEventListener('click', openFileDialog);
 }
+/* ---- 大きなPDFは、ファイルの中身をメモリに置かない（v4.11.2）
+ *  40MB以上のPDFは、ファイル（ディスク）から必要な部分だけをその都度読む（LazyPdf）。表示（PDF.js）は必要な範囲だけを受け取るので、
+ *  開いた直後のメモリにPDF全体が載らない。保存・ページ操作・注釈の変更など、PDF全体が必要な操作のときだけ全体を読み込む（baseAll）。
+ *  元のファイルに上書き保存する前には、全体をメモリに読み込んで固定する（pin。上書きしたあとで古い内容を読み続けないように） */
+const LAZY_MIN = 40 * 1024 * 1024;
+class LazyPdf {
+  constructor(length, reader, file = null, url = null) { this.length = length; this.byteLength = length; this._read = reader; this._mem = null; this._weak = null; this.file = file; this.url = url; }
+  // 先頭から順に読む（小さな塊で届くので、読み終えた分はすぐ手放せる）
+  async stream() { const c = this._cached(); if (c) return new Blob([c]).stream(); if (this.file) return this.file.stream(); return (await fetch(this.url)).body; }
+  _cached() { return this._mem || (this._weak && this._weak.deref()) || null; }
+  async read(b, e) {
+    e = Math.min(e, this.length); const c = this._cached();
+    if (c) return c.slice(b, e);
+    const u = new Uint8Array(await this._read(b, e));
+    if (u.length !== e - b) throw new Error('PDFファイルの読み込みに失敗しました（ファイルが変更・移動された可能性があります）');
+    return u;
+  }
+  async all() {
+    const c = this._cached(); if (c) return c;
+    const u = await this.read(0, this.length); this._weak = new WeakRef(u); return u;
+  }
+  async pin() { if (!this._mem) this._mem = await this.all(); }
+  get pinned() { return !!this._mem; }
+}
+const isLazy = (b) => b instanceof LazyPdf;
+// 今のPDF全体のバイト列（大きなPDFでは、このときにファイルから読み込む）
+const baseAll = async (b = S.baseBytes) => (isLazy(b) ? b.all() : b);
+// 元のファイルに上書きする前に: 読んでいるファイルの中身をメモリに固定する
+async function pinBase() { const b = S.baseBytes; if (isLazy(b)) await b.pin(); for (const sn of [...S.undo, ...S.redo]) if (isLazy(sn.b) && sn.b !== b) await sn.b.pin(); }
+// ファイル（File）から
+const lazyFromFile = (f) => new LazyPdf(f.size, (b, e) => f.slice(b, e).arrayBuffer(), f);
+// file:// のURLから（範囲を指定して読めるときだけ）。40MB未満・範囲を指定して読めないときは null
+//  Chrome の file:// は範囲指定（Range）で読めるが、ファイルの大きさを返さないので、1バイトずつ読めるかどうかで大きさを調べる
+async function lazyFromUrl(url) {
+  const rd = async (b, e) => {
+    const r = await fetch(url, { headers: { Range: `bytes=${b}-${e - 1}` } });
+    if (!r.ok) throw new Error('PDFファイルの一部を読み込めませんでした');
+    return r.arrayBuffer();
+  };
+  const ok = async (x) => { try { return (await rd(x, x + 1)).byteLength === 1; } catch { return false; } };
+  try {
+    if ((await rd(1000, 2000)).byteLength !== 1000) return null;       // 範囲を指定して読めない
+    if (!(await ok(LAZY_MIN))) return null;                             // 40MB未満
+    let lo = LAZY_MIN, hi = LAZY_MIN * 2;
+    while (await ok(hi)) { lo = hi; hi *= 2; if (hi > 2 ** 42) return null; }
+    while (hi - lo > 1) { const m = Math.floor((lo + hi) / 2); if (await ok(m)) lo = m; else hi = m; }
+    return new LazyPdf(lo + 1, rd, null, url);
+  } catch { return null; }
+}
+// 大きなPDFを少しずつ読みながら、文字列があるか調べる（後ろから。全体をメモリに置かない）
+async function lazyContains(src, ...strs) {
+  const ov = Math.max(...strs.map((t) => t.length)) - 1, rd = (await src.stream()).getReader();
+  let tail = new Uint8Array(0);
+  try {
+    for (;;) {
+      const { value, done } = await rd.read(); if (done) return false;
+      const buf = new Uint8Array(tail.length + value.length); buf.set(tail); buf.set(value, tail.length);
+      if (bytesContain(buf, ...strs)) return true;
+      tail = buf.slice(Math.max(0, buf.length - ov));                       // 塊の境目をまたぐ文字列のために、末尾を少し残す
+    }
+  } finally { try { rd.cancel(); } catch { /* ignore */ } }
+}
+// 編集ロック（暗号化）の情報: 大きなPDFでは、先頭と末尾だけを読んで調べる（分からなければ全体を読む）
+async function lockInfo(b = S.baseBytes) {
+  if (!isLazy(b)) return UNLOCK.info(b);
+  const head = await b.read(0, Math.min(b.length, 1 << 20)), tail = await b.read(Math.max(0, b.length - 8 * (1 << 20)), b.length);
+  const both = new Uint8Array(head.length + tail.length); both.set(head); both.set(tail, head.length);
+  const r = await UNLOCK.info(both);
+  return r && r.error ? UNLOCK.info(await b.all()) : r;
+}
+// v4.11.2: 大きなPDFは、PDF.js にファイル全体の写しを渡さず、必要な部分だけをその都度渡す（PDFDataRangeTransport）
+//  これまでは、画面側（保存・編集用）と PDF.js の作業スレッド（表示用）に、同じPDFを1つずつ持っていて、メモリが2倍になっていた。
+//  作業スレッドは、表示するページに必要な部分（文字・画像・フォントなど）だけを読み込むので、開いた直後のメモリが大きく減る。
+const RANGE_MIN = 4 * 1024 * 1024, RANGE_CHUNK = 256 * 1024;
 function pdfjsOpts(bytes) {
-  return { data: bytes.slice(), cMapUrl: LIB + 'cmaps/', cMapPacked: true,
+  const base = { cMapUrl: LIB + 'cmaps/', cMapPacked: true,
     standardFontDataUrl: LIB + 'standard_fonts/', wasmUrl: LIB + 'wasm/', iccUrl: LIB + 'iccs/',
     useSystemFonts: true, disableFontFace: S.textMode === 'outline', worker: PDFW };
+  if (!isLazy(bytes) && bytes.length < RANGE_MIN) return { ...base, data: bytes.slice() };     // 小さなPDFは、これまでどおり丸ごと渡す
+  const head = isLazy(bytes) ? null : bytes.slice(0, Math.min(bytes.length, RANGE_CHUNK * 4));
+  const tr = new pdfjsLib.PDFDataRangeTransport(bytes.length, head);
+  // 作業スレッドから頼まれた範囲を渡す（写しを渡す。元のバイト列は、保存・編集用にこちらで持ち続ける）
+  tr.requestDataRange = (begin, end) => {
+    const get = isLazy(bytes) ? bytes.read(begin, end) : Promise.resolve(bytes.slice(begin, Math.min(end, bytes.length)));
+    get.then((c) => tr.onDataRange(begin, c), (e) => { console.error(e); toast('PDFファイルを読み込めませんでした。ファイルが変更・移動された可能性があります。開き直してください。', 8000); });
+  };
+  return { ...base, range: tr, length: bytes.length, rangeChunkSize: isLazy(bytes) ? RANGE_CHUNK * 4 : RANGE_CHUNK, disableAutoFetch: true, disableStream: true };
 }
 async function openPdfJs(bytes) {
   const task = pdfjsLib.getDocument(pdfjsOpts(bytes));
@@ -1378,13 +1461,13 @@ function swapPdf(pdf) {
 }
 async function loadFromBytes(bytes, name, { handle = null, url = null, page = 1 } = {}) {
   const gen = ++S.loadGen;
-  const head = new TextDecoder('latin1').decode(bytes.subarray(0, 1024));
+  const head = new TextDecoder('latin1').decode(isLazy(bytes) ? await bytes.read(0, Math.min(1024, bytes.length)) : bytes.subarray(0, 1024));
   if (!head.includes('%PDF')) throw new Error('PDF形式のファイルではありません。');
   let annots = [], base = bytes;
   // v4.11.1: PDF.js での読み込み（作業スレッド）と、このアドオンの注釈があるかの確認（画面のスレッド）を同時に進める
   let pdfP = openPdfJs(bytes);
-  if (bytesContain(bytes, 'EPAType', MARKER)) {
-    try { const r = await extractOurs(bytes); base = r.bytes; annots = r.annots; }
+  if (!isLazy(bytes) && bytesContain(bytes, 'EPAType', MARKER)) {
+    try { const r = await extractOurs(await baseAll(bytes)); base = r.bytes; annots = r.annots; }
     catch (e) { console.warn('既存図形の取り込みに失敗', e); }
     if (base !== bytes) { pdfP.then((p) => p.destroy()).catch(() => {}); pdfP = openPdfJs(base); }
   }
@@ -1398,14 +1481,23 @@ async function loadFromBytes(bytes, name, { handle = null, url = null, page = 1 
   $('#fileName').textContent = name; $('#fileName').title = name;
   $('#btnNative').style.display = url ? '' : 'none';
   msgEl.style.display = 'none';
+  closeFind(); FIND.cache.clear(); findDet.clear(); FIND.q = '';                          // 別のPDFを開いた: 検索をやめる
   await buildPages(page);
   syncProps(); updateButtons(); scheduleList();
   refreshLock();                                                          // 編集ロックの確認は軽いので、すぐ行う（使えないボタンを早くグレーアウトする）
   // v4.11.1: 既存の注釈・しおりの一覧や、pdf-lib での試し読みは、最初のページが表示されてから行う（表示を待たせない）
   await afterFirstPaint(gen);
   if (gen !== S.loadGen) return;
+  // 大きなPDF（ファイルから少しずつ読む）は、このアドオンの注釈があるかを、最初のページを表示してから調べる
+  if (isLazy(base) && await lazyContains(base, 'EPAType', MARKER) && gen === S.loadGen) {
+    try {
+      const r = await extractOurs(await baseAll(base));
+      if (gen === S.loadGen && r.annots.length) { S.annots = r.annots; await setBase(r.bytes); S.undo = []; S.redo = []; S.dirty = false; updateButtons(); }
+    } catch (e) { console.warn('既存図形の取り込みに失敗', e); }
+    if (gen !== S.loadGen) return;
+  }
   collectNatives(); collectOutline();
-  probeLib(base, gen);
+  probeLib(S.baseBytes, gen);
 }
 // 表示中のページが描き終わるまで待つ（最長2秒）
 function afterFirstPaint(gen) {
@@ -1420,18 +1512,19 @@ async function setBase(bytes, { keepScroll = true } = {}) {
   if (S.editing) endEdit(false);
   const pdf = await openPdfJs(bytes);
   // v3.7: ページ数が同じなら、表示を作り直さずに差し替える（今の表示を残したまま描き直すので、白くならない）
-  if (keepScroll && S.pdf && S.pages.length === pdf.numPages) { await swapInPlace(pdf, bytes); refreshLock(); collectOutline(); return; }
+  if (keepScroll && S.pdf && S.pages.length === pdf.numPages) { await swapInPlace(pdf, bytes); refreshLock(); collectOutline(); findReset(); return; }
   swapPdf(pdf);
   ceOnBase(bytes);
   S.baseBytes = bytes; S.draft = null; S.drag = null; S.ghost = null;
   await buildPages(Math.min(cur, pdf.numPages));
   if (keepScroll) wrap.scrollTop = sy;
   syncProps(); updateButtons(); scheduleList();
-  collectNatives(); refreshLock(); collectOutline();
+  collectNatives(); refreshLock(); collectOutline(); findReset();
 }
 /** 文書を差し替える（ページの枠と描画済みの画像はそのまま。新しい内容の描画ができたページから、一度に入れ替える） */
 async function swapInPlace(pdf, bytes) {
   const old = S.pdf;
+  pvReset(true);
   for (const p of S.pages) { cancelRender(p); p.pageObj = null; if (p.rendered) p.rscale = -1; }
   S.pdf = pdf; ceOnBase(bytes);
   S.baseBytes = bytes; S.draft = null; S.drag = null; S.ghost = null;
@@ -1465,7 +1558,7 @@ async function swapInPlace(pdf, bytes) {
 // ページの枠をすべて作り直す（描画は見えている付近だけ、後から順に行う）
 async function buildPages(startPage = 1) {
   const gen = S.loadGen, pdf = S.pdf;
-  io.disconnect(); ioFar.disconnect();
+  io.disconnect(); ioFar.disconnect(); pvReset(false);
   pagesEl.replaceChildren(); S.pages = [];
   $('#pageCount').textContent = pdf.numPages; $('#pageNum').max = pdf.numPages;
   const first = await pdf.getPage(1);
@@ -1473,6 +1566,7 @@ async function buildPages(startPage = 1) {
   S.cur = S.want = clamp(startPage, 1, pdf.numPages);
   const curPage = S.cur === 1 ? first : await pdf.getPage(S.cur);
   if (S.fit === 'width' || S.fit === 'height' || S.fit === 'page') computeScale(curPage.getViewport({ scale: 1 }));
+  wrapDims = [wrap.clientWidth, wrap.clientHeight];                 // 全ページの枠を作る間は、表示領域の大きさを1回だけ測る
   for (let i = 1; i <= pdf.numPages; i++) {
     const el = document.createElement('div'); el.className = 'pg'; el.dataset.num = i;
     pagesEl.appendChild(el);
@@ -1480,6 +1574,7 @@ async function buildPages(startPage = 1) {
       view: null, svg: null, task: null, scale: S.scale, rscale: 0, rtarget: 0, rp: null, rc: 0 };
     S.pages.push(p); sizePage(p); io.observe(el); ioFar.observe(el);
   }
+  wrapDims = null;
   applyPaged();
   if (S.paged) wrap.scrollTop = 0; else if (startPage > 1) S.pages[S.cur - 1]?.el.scrollIntoView();
   $('#pageNum').value = S.cur;
@@ -1497,10 +1592,14 @@ async function buildPages(startPage = 1) {
 }
 /* ------------------------------------------------------- ズーム / フィット */
 function fitBase() { const p = S.pages[S.cur - 1]; return p && p.pageObj ? p.pageObj.getViewport({ scale: 1 }) : S.firstView1; }
+// v4.11.1: 全ページの大きさを直す間は、表示領域の大きさを1回だけ測って使い回す
+// （ページごとに測ると、そのたびにレイアウトの計算が走り、千ページ以上の文書で1秒以上止まっていた）
+let wrapDims = null;
 /** 1画面に収める倍率（v: 倍率1のビューポート, fit: 収め方。省略時は現在の設定） */
 function calcScale(v, fit = S.fit) {
   const fitV = fit === 'height' || fit === 'page';                   // v3.3: 縦に収める／ページ全体は、上下の余白なし
-  const cw = wrap.clientWidth - 40, ch = wrap.clientHeight - (fitV ? 0 : 24);
+  const dims = wrapDims || [wrap.clientWidth, wrap.clientHeight];
+  const cw = dims[0] - 40, ch = dims[1] - (fitV ? 0 : 24);
   const fw = cw / v.width; let fh = (ch - (fitV ? 0.5 : 1)) / v.height, s = S.scale;
   if (fit === 'width') s = fw;
   else if (fit === 'page') s = Math.min(fw, fh);
@@ -1561,7 +1660,9 @@ function layoutZoom(anchor, modeChanged) {
     if (d < bd) { bd = d; ref = p; fx = (cx - r.left) / r.width; fy = (cy - r.top) / r.height; if (d === 0) break; }
   }
   if (ZT.k !== 1 || ZT.tx || ZT.ty) setZoomTransform(1, 0, 0);        // 拡大縮小の途中の見た目（transform）を外してから、本当の大きさにする
-  for (const p of S.pages) { if (S.paged && !p.pageObj && p.num !== S.cur) { p.scale = S.scale; continue; } applyScale(p); }
+  wrapDims = [wrap.clientWidth, wrap.clientHeight];
+  try { for (const p of S.pages) { if (S.paged && !p.pageObj && p.num !== S.cur) { p.scale = S.scale; continue; } applyScale(p); } }
+  finally { wrapDims = null; }
   applyPaged();
   void wrap.offsetHeight;
   if (modeChanged || fitPaged()) {
@@ -1632,17 +1733,46 @@ function zoomByFactor(factor, anchor) {
     const f = zTarget / visScale();
     if (Math.abs(f - 1) < 1e-6) return;
     S.fit = null; pfTok++;
-    // カーソルの下の点が動かないように、拡大縮小の中心を合わせる（#pages の左上を原点とした座標で計算）
-    const wr = wrap.getBoundingClientRect();
-    const ax = (zAnchor ? zAnchor.x : wr.left + wr.width / 2) - wr.left + wrap.scrollLeft - pagesEl.offsetLeft;
-    const ay = (zAnchor ? zAnchor.y : wr.top + wr.height / 2) - wr.top + wrap.scrollTop - pagesEl.offsetTop;
-    const k2 = ZT.k * f, cp = S.pages[S.cur - 1];
-    let tx2 = ax - f * (ax - ZT.tx);
-    // 縮小してページの幅が画面より狭くなるときは、本当のレイアウトと同じく左右の中央に置く（止まったときに横にずれないように）
-    if (f < 1 && cp && cp.el.offsetWidth * k2 <= wrap.clientWidth - 2 && wrap.scrollLeft === 0) tx2 = (pagesEl.offsetWidth / 2) * (1 - k2);
-    setZoomTransform(k2, tx2, ay - f * (ay - ZT.ty));
+    zoomPreview(ZT.k * f, f);
     const s0 = S.scale; S.scale = visScale(); syncZoomUi(); S.scale = s0;            // 倍率の表示は、見えている倍率にする
   });
+}
+/* 拡大縮小の途中の見た目を、止まったあとの本当のレイアウトと同じ位置に置く（v4.11.1）
+ *  ・カーソルの下の点は動かさない
+ *  ・ページの幅が表示領域より狭いときは左右の中央（本当のレイアウトでは中央に置かれる）
+ *  ・広いときは、表示領域の外に余白ができないように、左右の端で止める（本当のレイアウトのスクロール範囲と同じ）
+ *  ・上下も、文書の先頭より上・末尾より下に余白ができないように止める
+ *  これで、止まったときに左右・上下へ動かない */
+function zoomPreview(k2, f) {
+  const wr = wrap.getBoundingClientRect(), cw = wrap.clientWidth, ch = wrap.clientHeight;
+  const wl = wr.left + wrap.clientLeft, wt = wr.top + wrap.clientTop;
+  const ax = zAnchor ? zAnchor.x : wl + cw / 2, ay = zAnchor ? zAnchor.y : wt + ch / 2;
+  // 基準のページ: 1ページ表示では表示中のページ、連続表示ではカーソルの高さにある（いちばん近い）ページ
+  let ref = S.paged ? S.pages[S.cur - 1] : null, R = ref ? ref.el.getBoundingClientRect() : null;
+  if (!ref) {
+    let bd = Infinity;
+    for (let i = Math.max(0, S.cur - 4); i < Math.min(S.pages.length, S.cur + 3); i++) {
+      const q = S.pages[i], r = q.el.getBoundingClientRect(); if (!r.height) continue;
+      const d = ay < r.top ? r.top - ay : ay > r.bottom ? ay - r.bottom : 0;
+      if (d < bd) { bd = d; ref = q; R = r; }
+    }
+  }
+  const P = pagesEl.getBoundingClientRect(), k0 = ZT.k;
+  const ox = P.left - ZT.tx, oy = P.top - ZT.ty;                        // #pages の左上（拡大縮小をかける前の位置）
+  if (!ref || !R || !R.width) { setZoomTransform(k2, ax - f * (ax - ox - ZT.tx) - ox, ay - f * (ay - oy - ZT.ty) - oy); return; }
+  const Lx = (R.left - P.left) / k0, Ly = (R.top - P.top) / k0, W2 = R.width * f;
+  // 左右
+  const left = W2 <= cw ? wl + (cw - W2) / 2 : clamp(ax - (ax - R.left) * f, wl + cw - W2, wl);
+  const tx = left - ox - k2 * Lx;
+  // 上下: カーソルの下の点を保ち、文書の先頭・末尾で止める
+  // （#pages の上下の余白は、本当のレイアウトでは拡大縮小しないので、その分も合わせる）
+  const cs = getComputedStyle(pagesEl), padT = parseFloat(cs.paddingTop) || 0, padB = parseFloat(cs.paddingBottom) || 0;
+  const s0 = wrap.scrollTop, Hp = P.height / k0, Hall = k2 * (Hp - padT - padB) + padT + padB;
+  const topMax = s0 + padT * (1 - k2), topMin = wt + ch - padB - oy - k2 * (Hp - padB);
+  let ty = ay - (ay - R.top) * f - oy - k2 * Ly;
+  if (Hall <= ch) ty = topMax;                                               // 文書全体が表示領域に収まる: 先頭に揃う
+  else ty = clamp(ty, topMin, topMax);
+  setZoomTransform(k2, tx, ty);
 }
 // 拡大縮小が止まった: 本当の大きさにレイアウトし直して（カーソルの下の点はそのまま）、描き直す
 function commitZoom() {
@@ -1844,7 +1974,7 @@ function renderPrio(p) {
 function renderSlot(p, gen) {
   return new Promise((res) => { p.slotRes = res; p.slotGen = gen; RS.queue.add(p); slotPump(); });
 }
-function slotDone(p) { if (RS.active.delete(p)) slotPump(); }
+function slotDone(p) { if (RS.active.delete(p)) slotPump(); if (!RS.active.size) pvKick(150); }
 function slotPump() {
   for (const q of RS.queue) if (q.slotGen !== q.gen || renderPrio(q) === Infinity) { RS.queue.delete(q); q.slotRes(false); }
   const busy = scrollingNow() && !S.paged;
@@ -1893,7 +2023,7 @@ function frameKick() {
 }
 function idleKick() {
   clearTimeout(RS.timer);
-  RS.timer = setTimeout(() => { if (scrollingNow()) { idleKick(); return; } requestNear(); slotPump(); drawPump(); upgradePending(); }, 150);
+  RS.timer = setTimeout(() => { if (scrollingNow()) { idleKick(); return; } requestNear(); slotPump(); drawPump(); upgradePending(); pvKick(200); }, 150);
 }
 // スクロールが止まったとき: 画面の付近で、まだ描いていないページを描く（スクロール中に取りやめたページなど）
 function requestNear() {
@@ -1924,6 +2054,26 @@ wrap.addEventListener('scroll', () => {
   RS.lastScroll = now; RS.lastTop = wrap.scrollTop;
   dropFarRenders(); idleKick();
 }, { passive: true });
+/* ---- メモリの整理（v4.11.2）
+ *  PDF.js は、読み込んだページのフォントや画像を、文書を閉じるまで覚えておく。大きな文書をたくさん見る（検索で全ページを読む）と
+ *  数百MB以上になるので、ある程度のページを読んだら、描画していないときに PDF.js の覚えている内容を手放す（PDFDocumentProxy.cleanup）。
+ *  表示中のページの絵はそのまま。手放したフォントは次に必要になったときに読み直す（フォントの変換結果は別に覚えているので速い） */
+const CLEAN_EVERY = 80;
+let workSince = 0, cleaning = null, cleanTimer = 0;
+function noteWork() { if (++workSince >= CLEAN_EVERY) { clearTimeout(cleanTimer); cleanTimer = setTimeout(() => maybeCleanup(), 1500); } }
+async function maybeCleanup(force = false) {
+  if (!S.pdf || cleaning || (!force && workSince < CLEAN_EVERY)) return cleaning;
+  if (RS.active.size || RS.queue.size || S.zooming || S.busy || S.editing || PV.busy) {          // 描画中などは待つ
+    clearTimeout(cleanTimer); cleanTimer = setTimeout(() => maybeCleanup(force), 1000); return null;
+  }
+  const pdf = S.pdf;
+  cleaning = (async () => {
+    try { await pdf.cleanup(); workSince = 0; }
+    catch (e) { clearTimeout(cleanTimer); cleanTimer = setTimeout(() => maybeCleanup(force), 1000); }      // 描画が始まっていた: あとでもう一度
+    finally { cleaning = null; }
+  })();
+  return cleaning;
+}
 /** 描画を中止する（今の表示内容は残す） */
 function cancelRender(p) {
   p.gen++; try { p.task && p.task.cancel(); } catch { /* ignore */ }
@@ -1932,8 +2082,70 @@ function cancelRender(p) {
 }
 /** 描画内容を捨てて、空の枠に戻す（PDF.js の、そのページの描画用データも手放す＝メモリを抑える） */
 function releasePage(p) {
+  // 描いてあった絵から縮小版を作っておく（読み直し不要で軽い。戻ってきたときにすぐ見せられる）
+  if (!p.prev && p.rendered && Math.abs(p.num - S.cur) <= PV_KEEP) {
+    const big = p.el.querySelector(':scope > canvas:not(.pv)');
+    if (big && big.width > 0) {
+      const k = Math.min(1, PV_W * 1.4 / Math.max(big.width, big.height)), cv = document.createElement('canvas'); cv.className = 'pv';
+      cv.width = Math.max(1, Math.round(big.width * k)); cv.height = Math.max(1, Math.round(big.height * k));
+      const x = cv.getContext('2d'); x.imageSmoothingQuality = 'high'; x.drawImage(big, 0, 0, cv.width, cv.height); p.prev = cv;
+    }
+  }
   cancelRender(p); p.svg = null; p.rendered = false; p.rscale = 0; p.rquick = false; p.el.replaceChildren();
+  if (p.prev) p.el.appendChild(p.prev);                  // 縮小版があれば、それを見せておく
   if (p.pageObj) { try { p.pageObj.cleanup(); } catch { /* ignore */ } }
+}
+/* ---- 前後のページの縮小版（v4.11.2）
+ *  表示中のページの前後（連続表示は前 PV_BACK・後ろ PV_AHEAD ページ）を、小さな画像（幅 PV_W 画素）で先に描いておく。
+ *  スクロールしてきたときは、本来の描画が終わるまで縮小版を引き伸ばして見せる（「レンダリング中…」の代わり）。
+ *  縮小版は1ページ約0.6MB。画面の描画（本来の大きさ）がないときだけ、1ページずつ描く。遠く離れたページの縮小版は捨てる */
+const PV_AHEAD = 20, PV_BACK = 8, PV_W = 360, PV_KEEP = 40;
+const PV = { busy: false, timer: 0, gen: 0 };
+function pvKick(ms = 120) { clearTimeout(PV.timer); PV.timer = setTimeout(pumpPreview, ms); }
+function pvTargets() {
+  const N = S.pages.length, c = S.cur, d = S.dirNav || 1, out = [];
+  for (let k = 1; k <= Math.max(PV_AHEAD, PV_BACK); k++) {             // 進む方向を先に、近い順
+    if (k <= PV_AHEAD && c + k * d >= 1 && c + k * d <= N) out.push(c + k * d);
+    if (k <= PV_BACK && c - k * d >= 1 && c - k * d <= N) out.push(c - k * d);
+  }
+  return [c, ...out].map((n) => S.pages[n - 1]);
+}
+async function pumpPreview() {
+  if (PV.busy || !S.pdf || S.zooming || S.busy) return;
+  const flipping = S.paged && performance.now() - RS.lastFlip < FLIP_SETTLE * 2;
+  if (RS.active.size || RS.queue.size || cleaning || flipping || (scrollingNow() && !S.paged)) { pvKick(200); return; }   // 本来の描画・スクロール・ページ送りが先
+  // 遠く離れたページの縮小版は捨てる
+  for (const p of S.pages) if (p.prev && Math.abs(p.num - S.cur) > PV_KEEP) { if (p.prev.isConnected) p.prev.remove(); p.prev = null; }
+  const p = pvTargets().find((q) => q && !q.prev && !q.rendered);
+  if (!p) { if (PV.made) { PV.made = 0; maybeCleanup(true); } return; }      // 縮小版を描き終えた: 描画に使ったフォントなどを手放す
+  PV.busy = true; const gen = PV.gen, pdf = S.pdf;
+  try {
+    const page = p.pageObj || (p.pageObj = await pdf.getPage(p.num));
+    if (gen !== PV.gen || pdf !== S.pdf) return;
+    const v1 = page.getViewport({ scale: 1 }), view = page.getViewport({ scale: Math.min(1, PV_W / Math.max(v1.width, v1.height) * 1.4) });
+    const cv = document.createElement('canvas'); cv.className = 'pv';
+    cv.width = Math.max(1, Math.floor(view.width)); cv.height = Math.max(1, Math.floor(view.height));
+    const task = page.render({ canvasContext: cv.getContext('2d'), viewport: view });
+    // 描き込みは、スクロール中・本来の描画があるときは待つ（画面の動きを優先）
+    task.onContinue = (cont) => { const go = () => ((scrollingNow() && !S.paged) || S.zooming || RS.waiting.size || RS.active.size ? setTimeout(go, 50) : cont()); go(); };
+    p.pvTask = task;
+    await task.promise;
+    p.pvTask = null;
+    if (gen !== PV.gen || pdf !== S.pdf) return;
+    p.prev = cv; PV.made = (PV.made || 0) + 1;
+    if (!p.rendered) p.el.appendChild(cv);
+    if (Math.abs(p.num - S.cur) > 3) { try { page.cleanup(); } catch { /* ignore */ } }   // すぐには本来の大きさで描かないページは、描画用のデータを手放す
+    noteWork();
+  } catch (e) { if (!e || e.name !== 'RenderingCancelledException') console.warn('preview', e); }
+  finally { PV.busy = false; p.pvTask = null; pvKick(30); }
+}
+// 文書が変わった・拡大縮小の途中など: 縮小版を作り直す（今描いている縮小版は取りやめる）
+function pvReset(drop) {
+  PV.gen++;
+  for (const p of S.pages) {
+    if (p.pvTask) { try { p.pvTask.cancel(); } catch { /* ignore */ } p.pvTask = null; }
+    if (drop && p.prev) { if (p.prev.isConnected) p.prev.remove(); p.prev = null; }
+  }
 }
 function pickSS(q, W, H) {
   let ss = 1;
@@ -2045,6 +2257,8 @@ async function doRender(p, gen) {
     p.view = view; p.svg = svg; p.rendered = true; p.rscale = sc; p.rquick = quick;
     p.el.style.width = view.width + 'px'; p.el.style.height = view.height + 'px'; p.el.style.setProperty('--scale-factor', sc);
     p.el.replaceChildren(canvas, td, svg);
+    drawHits(p);                                                            // 検索結果の強調表示（v4.11.2）
+    noteWork();
     redrawPage(p);
     if (S.editing && S.editing.a.page === p.num && !S.editing.ta.isConnected) p.el.appendChild(S.editing.ta);
     if (!quick) afterScroll(() => { if (gen === p.gen && p.view === view) buildTextLayer(p, gen, view, sc); });
@@ -2470,10 +2684,11 @@ async function convertToInk() {
 /* ------------------------------------------------------- 履歴 (undo / redo) */
 const takeSnap = () => ({ a: JSON.stringify(S.annots), b: S.baseBytes });
 function trimUndo() {
-  const seen = new Set(); let tot = S.baseBytes ? S.baseBytes.length : 0; seen.add(S.baseBytes);
+  const mem = (b) => (!b ? 0 : isLazy(b) && !b.pinned ? 0 : b.length);       // ファイルから読む版は、メモリを使わない
+  const seen = new Set(); let tot = mem(S.baseBytes); seen.add(S.baseBytes);
   for (let i = S.undo.length - 1; i >= 0; i--) {
     const b = S.undo[i].b;
-    if (!seen.has(b)) { seen.add(b); tot += b.length; }
+    if (!seen.has(b)) { seen.add(b); tot += mem(b); }
     if (tot > 300e6 && i > 0) { S.undo.splice(0, i); break; }
   }
 }
@@ -2498,7 +2713,7 @@ async function redo() { if (S.busy || !S.redo.length) return; const cur = takeSn
 function updateButtons() {
   $('#btnUndo').disabled = !S.undo.length; $('#btnRedo').disabled = !S.redo.length;
   $('#btnDelete').disabled = !(S.sel.size || (S.tool === 'edit' && ce.sel.size));
-  for (const id of ['#btnDocProps', '#btnPrint', '#btnEmbed', '#btnRotL', '#btnRotR', '#btnSave', '#btnSaveAs', '#btnStamp', '#btnDateStamp', '#btnDateStampCfg', '#btnPages', '#btnOrg']) $(id).disabled = !S.pdf;
+  for (const id of ['#btnDocProps', '#btnPrint', '#btnEmbed', '#btnRotL', '#btnRotR', '#btnSave', '#btnSaveAs', '#btnStamp', '#btnDateStamp', '#btnDateStampCfg', '#btnPages', '#btnOrg', '#btnFind']) $(id).disabled = !S.pdf;
   // 編集ロック: 使えない機能はグレーアウトし、理由をツールチップに出す
   const enc = !!S.pdf && encLocked(), noAnnot = !!S.pdf && !S.lock.annot, noPrint = !!S.pdf && !S.lock.print;
   const lockEl = (el, off, why) => {
@@ -3227,13 +3442,30 @@ async function pasteFromClipboardButton() {
 }
 /* ---- v3.2: 注釈のコピー・切り取り・貼り付け（Ctrl+C / Ctrl+X / Ctrl+V）、複製（Ctrl+D） */
 const CLIP_MARK = 'EPA-ANNOTS:';
-const clip = { items: null, mark: '', n: 0 };
+const clip = { items: null, mark: '', n: 0, other: false };
+const ANNOTCLIP_KEY = 'annotClip';
+// ほかのタブでコピーした注釈を読み込む（クリップボードの目印が一致するときだけ）。スタンプの画像はこのタブに登録し直す
+async function loadOtherClip(mark) {
+  const c = await IDB.get(ANNOTCLIP_KEY);
+  if (!c || c.mark !== mark || !Array.isArray(c.items) || !c.items.length) return false;
+  const ids = new Map();
+  for (const [id, b] of Object.entries(c.images || {})) {
+    try { ids.set(id, await registerImage(b instanceof Uint8Array ? b : new Uint8Array(b))); } catch { /* ignore */ }
+  }
+  clip.items = c.items.map((a) => (a.type === 'stamp' ? { ...a, img: ids.get(a.img) || null } : a)).filter((a) => a.type !== 'stamp' || a.img);
+  clip.mark = c.mark; clip.n = 0; clip.other = true;
+  return clip.items.length > 0;
+}
 const typingTarget = (t) => t && (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA' || t.isContentEditable);
 const textSelected = () => { const g = window.getSelection && window.getSelection(); return !!(g && !g.isCollapsed && String(g).trim()); };
 function copyAnnots() {
   const ours = selOurs();
   if (!ours.length) { if (selNatives().length) toast('既存の注釈（他のソフトで作成したもの）はコピーできません'); return false; }
-  clip.items = ours.map(clone); clip.mark = CLIP_MARK + newId(); clip.n = 0;
+  clip.items = ours.map(clone); clip.mark = CLIP_MARK + newId(); clip.n = 0; clip.other = false;
+  // v4.11.1: 同じブラウザのほかのタブ（ほかのPDF）でも貼り付けられるように、注釈（スタンプの画像も）を保存しておく
+  const images = {};
+  for (const a of clip.items) if (a.type === 'stamp' && a.img && S.images.has(a.img)) images[a.img] = S.images.get(a.img).bytes;
+  IDB.set(ANNOTCLIP_KEY, { mark: clip.mark, items: clip.items, images, time: Date.now() });
   const skip = selNatives().length;
   toast(`${ours.length}個の注釈をコピーしました${skip ? `（既存の注釈${skip}個は対象外）` : ''}。Ctrl+Vで貼り付け`, 2500);
   return true;
@@ -3242,7 +3474,7 @@ function copyAnnots() {
 function pasteAnnots() {
   if (!clip.items || !S.pdf) return;
   clip.n++;
-  const page = S.cur, src = clip.items[0].page, k = page === src ? 12 * clip.n : 12 * (clip.n - 1);   // 同じページなら少しずらす
+  const page = S.cur, src = clip.items[0].page, k = page === src && !clip.other ? 12 * clip.n : 12 * (clip.n - 1);   // 同じページなら少しずらす
   const snap = takeSnap(), made = [];
   for (const o of clip.items) {
     const a = clone(o); a.id = newId(); a.page = page; a.author = S.author; a.date = new Date().toISOString();
@@ -3270,6 +3502,14 @@ window.addEventListener('cut', (e) => {
 });
 window.addEventListener('paste', async (e) => {
   const t = e.target; if (t && (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA')) return;
+  // ほかのタブでコピーした注釈（クリップボードに目印の文字列がある）
+  const mk = e.clipboardData ? e.clipboardData.getData('text/plain') : '';
+  if (S.tool !== 'edit' && S.pdf && mk.startsWith(CLIP_MARK) && mk !== clip.mark) {
+    e.preventDefault();
+    if (!S.lock.annot) { toast('このPDFは文書の設定で注釈の追加が禁止されているため、貼り付けられません', 5000); return; }
+    if (await loadOtherClip(mk)) pasteAnnots(); else toast('コピーした注釈が見つかりませんでした（もう一度コピーしてください）', 4000);
+    return;
+  }
   if (S.tool !== 'edit' && clip.items) {           // コピーした注釈（クリップボードがその後に変わっていなければ）
     const txt = e.clipboardData ? e.clipboardData.getData('text/plain') : '';
     const hasImg = [...((e.clipboardData && e.clipboardData.items) || [])].some((i) => i.kind === 'file' && i.type.startsWith('image/'));
@@ -3387,7 +3627,7 @@ function ceOnBase(bytes) {
 function ceDoc() {
   if (ce.docBytes !== S.baseBytes || !ce.docP) {
     ce.docBytes = S.baseBytes; ce.ready.clear(); ce.pending.clear();
-    ce.docP = PDFDocument.load(S.baseBytes, { updateMetadata: false });
+    ce.docP = baseAll().then((b) => PDFDocument.load(b, { updateMetadata: false }));
     ce.docP.catch(() => {});
   }
   return ce.docP;
@@ -3937,6 +4177,8 @@ window.addEventListener('keydown', (e) => {
   if (mod && e.key.toLowerCase() === 's') { e.preventDefault(); if (!e.repeat) save(e.shiftKey); return; }   // 押し続けても1回だけ
   if (mod && e.key.toLowerCase() === 'o') { e.preventDefault(); openFileDialog(); return; }
   if (mod && e.key.toLowerCase() === 'p') { e.preventDefault(); printDoc(); return; }
+  if (mod && e.key.toLowerCase() === 'f' && !org.open) { e.preventDefault(); openFind(); return; }
+  if (e.key === 'F3' && S.pdf) { e.preventDefault(); if (!FIND.open) openFind(); else findStep(e.shiftKey ? -1 : 1); return; }
   if (typing) return;
   if (mod && e.key.toLowerCase() === 'b' && S.pdf && !S.busy) { e.preventDefault(); if (encLocked()) toast('このPDFは編集ロックがかかっているため、しおりを追加できません。', 5000); else bmAdd(); return; }
   if (mod && e.key.toLowerCase() === 'z') { e.preventDefault(); e.shiftKey ? redo() : undo(); return; }
@@ -4019,6 +4261,7 @@ async function ensureWrite(h) {
   } catch { return false; }
 }
 async function writeHandle(h, bytes) {
+  await pinBase();                                      // v4.11.2: 読んでいる元のファイルに上書きするかもしれないので、先にメモリに固定する
   assertPdfBytes(bytes);
   const w = await h.createWritable();
   try { await w.write(new Blob([bytes], { type: 'application/pdf' })); await w.close(); }
@@ -4034,6 +4277,7 @@ async function restoreHandle() {
 const hasDownloads = () => !!(hasChrome && chrome.downloads && chrome.downloads.download);
 const cbp = (fn) => new Promise((res, rej) => fn((v) => (chrome.runtime.lastError ? rej(new Error(chrome.runtime.lastError.message)) : res(v))));
 async function downloadBytes(bytes, filename, { saveAs = false } = {}) {
+  await pinBase();
   const url = URL.createObjectURL(new Blob([bytes], { type: 'application/pdf' }));
   try {
     if (hasDownloads()) {
@@ -4208,15 +4452,17 @@ window.addEventListener('beforeunload', (e) => {
   }, 0);
 });
 /* ------------------------------------------------------- 開く / 取得 */
+// ファイルの中身: 大きなファイルは、必要な部分だけをその都度読む（LazyPdf）。小さなファイルは、これまでどおり全体を読む
+const fileSource = async (f) => (f.size >= LAZY_MIN ? lazyFromFile(f) : new Uint8Array(await f.arrayBuffer()));
 async function openFileDialog() {
   if (!(await confirmUnsaved('別のPDFを開く'))) return;
   try {
     if (window.showOpenFilePicker) {
       const [h] = await window.showOpenFilePicker({ types: PDF_PICKER_TYPES });
-      const f = await h.getFile(); await loadFromBytes(new Uint8Array(await f.arrayBuffer()), f.name, { handle: h });
+      const f = await h.getFile(); await loadFromBytes(await fileSource(f), f.name, { handle: h });
     } else {
       const inp = document.createElement('input'); inp.type = 'file'; inp.accept = '.pdf,application/pdf';
-      inp.onchange = async () => { const f = inp.files[0]; if (f) await loadFromBytes(new Uint8Array(await f.arrayBuffer()), f.name); };
+      inp.onchange = async () => { const f = inp.files[0]; if (f) await loadFromBytes(await fileSource(f), f.name); };
       inp.click();
     }
   } catch (e) { if (e && e.name !== 'AbortError') { console.error(e); showMsg(`<p>PDFを開けませんでした。</p><p class="small">${esc(e.message || e)}</p><button type="button">PDFファイルを開く</button>`, true); } }
@@ -4233,9 +4479,13 @@ async function loadFromUrl(url) {
   }
   showMsg('<p>読み込み中…</p>');
   try {
-    const r = await fetch(url);
-    if (!r.ok) throw new Error(`HTTP ${r.status}`);
-    const buf = new Uint8Array(await r.arrayBuffer());
+    // 大きなファイルは、範囲を指定して読めれば（file:// は読める）、全体を読み込まずに開く
+    let buf = /^file:/i.test(url) ? await lazyFromUrl(url) : null;
+    if (!buf) {
+      const r = await fetch(url);
+      if (!r.ok) throw new Error(`HTTP ${r.status}`);
+      buf = new Uint8Array(await r.arrayBuffer());
+    }
     let name = 'document.pdf';
     try { const u = new URL(url); name = decodeURIComponent(u.pathname.split('/').filter(Boolean).pop() || name); if (!/\.pdf$/i.test(name)) name += '.pdf'; } catch { /* ignore */ }
     const m = /[#&]page=(\d+)/.exec(url);
@@ -4270,7 +4520,7 @@ window.addEventListener('drop', async (e) => {
         const it = [...e.dataTransfer.items].find((x) => x.kind === 'file' && x.type === 'application/pdf');
         let h = null; if (it && it.getAsFileSystemHandle) { h = await it.getAsFileSystemHandle(); if (h && h.kind !== 'file') h = null; }
         const f = h ? await h.getFile() : pdf;
-        await loadFromBytes(new Uint8Array(await f.arrayBuffer()), f.name, { handle: h });
+        await loadFromBytes(await fileSource(f), f.name, { handle: h });
       } catch (err) { console.error(err); toast('PDFを開けませんでした: ' + err.message, 5000); }
     } else {
       const el = document.elementFromPoint(e.clientX, e.clientY);
@@ -4348,6 +4598,199 @@ const gammaLabel = () => { $('#gammaVal').textContent = S.gamma + '%' + (S.gamma
 $('#rngGamma').value = S.gamma; gammaLabel(); applyGamma();
 $('#rngGamma').addEventListener('input', (e) => { S.gamma = +e.target.value; LS.set('gamma', S.gamma); gammaLabel(); applyGamma(); });
 $('#gammaReset').addEventListener('click', () => { S.gamma = 100; $('#rngGamma').value = 100; LS.set('gamma', 100); gammaLabel(); applyGamma(); });
+/* ------------------------------------------------------- 検索（v4.11.2）
+ *  PDF.js でページの文字を読み取り（読み取った結果は覚えておく）、表示中のページから順に探す。見つかった分から件数を出し、移動できる。
+ *  大文字と小文字・全角と半角は区別せず、空白と改行は無視して探す（PDFでは、文字の間に空白が入っていたり、行の途中で分かれていたりするため） */
+const FIND = { open: false, q: '', gen: 0, byPage: new Map(), order: [], cur: null, cache: new Map(), scanned: 0, done: false, timer: 0 };
+const isWide = (cp) => cp >= 0x2e80;
+// 1文字ずつ、比べやすい形（NFKC・小文字）にする。元の文字の位置も覚えておく
+function normChars(str) {
+  const out = []; let ci = 0;
+  for (const ch of str) {
+    for (const n of ch.normalize('NFKC').toLowerCase()) if (!/\s/.test(n)) out.push([n, ci]);
+    ci++;
+  }
+  return out;
+}
+const normQuery = (q) => normChars(q).map((x) => x[0]).join('');
+// ページの文字を読み取り、比べる文字列（s）と、元の文字の位置（map）、文字列の項目（items）にする
+async function readPageText(n) {
+  const pdf = S.pdf, page = await pdf.getPage(n);
+  const tc = await page.getTextContent();
+  if (pdf !== S.pdf) return null;
+  const items = [], chars = [], map = [];
+  for (const it of tc.items) {
+    if (typeof it.str !== 'string' || !it.str) continue;
+    const st = tc.styles[it.fontName] || {}, k = items.length;
+    items.push({ t: it.transform, w: it.width, h: it.height, v: !!st.vertical, str: it.str });
+    for (const [ch, ci] of normChars(it.str)) { chars.push(ch); map.push(k * 65536 + ci); }
+  }
+  noteWork();
+  return { s: chars.join(''), map: Uint32Array.from(map), items };
+}
+// 検索用に覚えておくのは、比べる文字列だけ（大きな文書でもメモリを使いすぎないように。1400ページで数MB）。
+// 見つかった箇所の位置（文字列の項目の座標）は、色を付けるときに読み直し、最近の数ページ分だけ覚えておく
+const FIND_DET_MAX = 24;
+const findDet = new Map();
+function putDet(n, d) { findDet.delete(n); findDet.set(n, d); while (findDet.size > FIND_DET_MAX) findDet.delete(findDet.keys().next().value); }
+async function pageText(n) {
+  const c = FIND.cache.get(n); if (c !== undefined) return { s: c };
+  const d = await readPageText(n); if (!d) return null;
+  FIND.cache.set(n, d.s); putDet(n, d);
+  return d;
+}
+async function pageDetail(n) {
+  const d = findDet.get(n); if (d) { putDet(n, d); return d; }
+  const r = await readPageText(n); if (r) putDet(n, r);
+  return r;
+}
+// 文字列の項目の中での、文字の位置（0〜1）。全角は半角の約2倍の幅とみなす
+function itemPos(it) {
+  const w = [...it.str].map((ch) => (isWide(ch.codePointAt(0)) ? 1 : 0.55)), tot = w.reduce((a, b) => a + b, 0) || 1;
+  const pos = [0]; for (const x of w) pos.push(pos[pos.length - 1] + x / tot);
+  return pos;
+}
+// 見つかった文字の範囲を、PDFの座標の四角形（四隅）にする（文字列の項目ごとに1つ）
+function hitQuads(t, h) {
+  const out = []; let i = h.a;
+  while (i < h.b) {
+    const k = Math.floor(t.map[i] / 65536), c0 = t.map[i] % 65536; let c1 = c0;
+    while (i < h.b && Math.floor(t.map[i] / 65536) === k) { c1 = Math.max(c1, t.map[i] % 65536); i++; }
+    const it = t.items[k], [a, b, c, d, e, f] = it.t;
+    const nu = Math.hypot(a, b) || 1, nv = Math.hypot(c, d) || 1, u = [a / nu, b / nu], v = [c / nv, d / nv];
+    const pos = itemPos(it), t0 = pos[c0], t1 = pos[Math.min(c1 + 1, pos.length - 1)];
+    if (it.v) {                                 // 縦書き: 上から下へ進む
+      const L = it.h || nv, W = it.w || nv, x0 = e - u[0] * W / 2, y0 = f;
+      const p = (s, q) => [x0 + u[0] * q * W - v[0] * s * L, y0 + u[1] * q * W - v[1] * s * L];
+      out.push([p(t0, 0), p(t0, 1), p(t1, 1), p(t1, 0)]);
+    } else {
+      const L = it.w, H = it.h || nv;
+      const p = (s, q) => [e + u[0] * s * L + v[0] * q * H, f + u[1] * s * L + v[1] * q * H];
+      out.push([p(t0, -0.22), p(t1, -0.22), p(t1, 0.9), p(t0, 0.9)]);
+    }
+  }
+  return out;
+}
+// ページに、見つかった箇所の色を付ける
+function drawHits(p) {
+  const old = p.el.querySelector(':scope > svg.hl'); if (old) old.remove();
+  const hs = FIND.open && FIND.byPage.get(p.num);
+  if (!hs || !hs.length) return;
+  const t = findDet.get(p.num);
+  if (!t) { const g = FIND.gen; pageDetail(p.num).then((d) => { if (d && g === FIND.gen) drawHits(p); }).catch(() => {}); return; }
+  const view = p.view || (p.pageObj ? p.pageObj.getViewport({ scale: p.scale }) : null); if (!view) return;
+  const svg = document.createElementNS(NS, 'svg'); svg.setAttribute('class', 'hl'); svg.setAttribute('viewBox', `0 0 ${view.width} ${view.height}`);
+  svg.setAttribute('preserveAspectRatio', 'none');
+  hs.forEach((h, j) => {
+    const curr = FIND.cur && FIND.cur.page === p.num && FIND.cur.j === j;
+    for (const q of hitQuads(t, h)) {
+      const pts = q.map((pt) => view.convertToViewportPoint(pt[0], pt[1]).map((x) => x.toFixed(1)).join(',')).join(' ');
+      svgEl('polygon', { points: pts, class: curr ? 'cur' : '' }, svg);
+    }
+  });
+  const cv = p.el.querySelector(':scope > canvas');
+  p.el.insertBefore(svg, cv ? cv.nextSibling : p.el.firstChild);
+}
+function findInfo() {
+  const n = FIND.order.length, idx = FIND.cur ? FIND.order.findIndex((x) => x.page === FIND.cur.page && x.j === FIND.cur.j) + 1 : 0;
+  const prog = FIND.done || !FIND.q ? '' : `（検索中 ${FIND.scanned}/${S.pdf ? S.pdf.numPages : 0}ページ）`;
+  $('#findInfo').textContent = !FIND.q ? '' : n ? `${idx || '-'} / ${n}件${prog}` : FIND.done ? '見つかりません' : `0件${prog}`;
+  $('#findInput').classList.toggle('none', !!(FIND.q && FIND.done && !n));
+}
+function rebuildOrder() {
+  FIND.order = [];
+  for (const pg of [...FIND.byPage.keys()].sort((a, b) => a - b)) FIND.byPage.get(pg).forEach((h, j) => FIND.order.push({ page: pg, j }));
+}
+// 検索を始める（表示中のページから末尾へ、そのあと先頭から）
+async function runFind() {
+  const gen = ++FIND.gen, q = normQuery(FIND.q);
+  FIND.byPage = new Map(); FIND.order = []; FIND.cur = null; FIND.scanned = 0; FIND.done = false;
+  for (const p of S.pages) drawHits(p);
+  if (!q || !S.pdf) { FIND.done = true; findInfo(); return; }
+  findInfo();
+  const N = S.pdf.numPages, start = S.cur; let lastInfo = 0;
+  for (let k = 0; k < N; k++) {
+    if (gen !== FIND.gen || !S.pdf) return;
+    while (RS.active.size && !FIND.cache.has(((start - 1 + k) % N) + 1)) {     // 表示中のページの描画を優先する
+      await new Promise((r) => setTimeout(r, 60)); if (gen !== FIND.gen) return;
+    }
+    const n = ((start - 1 + k) % N) + 1;
+    if (workSince >= CLEAN_EVERY) { await maybeCleanup(); if (gen !== FIND.gen) return; }
+    let t = null; try { t = await pageText(n); } catch (e) { console.warn('find', n, e); }
+    if (gen !== FIND.gen) return;
+    FIND.scanned++;
+    if (t) {
+      const hs = []; let i = t.s.indexOf(q);
+      while (i >= 0) { hs.push({ a: i, b: i + q.length }); i = t.s.indexOf(q, i + q.length); }
+      if (hs.length) {
+        FIND.byPage.set(n, hs); rebuildOrder();
+        const p = S.pages[n - 1]; if (p) drawHits(p);
+        if (!FIND.cur) showHit({ page: n, j: 0 });
+      }
+    }
+    if (performance.now() - lastInfo > 150) { lastInfo = performance.now(); findInfo(); }
+  }
+  FIND.done = true; findInfo(); maybeCleanup(true);
+}
+// 見つかった箇所へ移動して、画面の中央あたりに見せる
+function showHit(h) {
+  const prev = FIND.cur; FIND.cur = h; findInfo();
+  if (prev && S.pages[prev.page - 1]) drawHits(S.pages[prev.page - 1]);
+  const p = S.pages[h.page - 1], hit = FIND.byPage.get(h.page)[h.j];
+  if (S.paged) showPage(h.page, 'top'); else goPage(h.page);
+  let t = null;
+  Promise.all([ensurePage(p), pageDetail(h.page).then((d) => { t = d; })]).then(() => {
+    if (FIND.cur !== h || !t) return;
+    drawHits(p);
+    const view = p.pageObj.getViewport({ scale: p.scale }), qs = hitQuads(t, hit);
+    const xs = [], ys = []; for (const q of qs) for (const pt of q) { const v = view.convertToViewportPoint(pt[0], pt[1]); xs.push(v[0]); ys.push(v[1]); }
+    const cx = (Math.min(...xs) + Math.max(...xs)) / 2, cy = (Math.min(...ys) + Math.max(...ys)) / 2;
+    wrap.scrollTop = (S.paged ? 0 : p.el.offsetTop) + cy - wrap.clientHeight / 2;
+    if (p.el.offsetWidth > wrap.clientWidth) wrap.scrollLeft = p.el.offsetLeft + cx - wrap.clientWidth / 2;
+  }).catch(() => {});
+}
+function findStep(dir) {
+  if (!FIND.order.length) { if (FIND.q && !FIND.done) toast('検索中です…', 1200); return; }
+  let i = FIND.cur ? FIND.order.findIndex((x) => x.page === FIND.cur.page && x.j === FIND.cur.j) : -1;
+  if (i < 0) {                                   // まだ移動していない: 表示中のページから探す
+    i = dir > 0 ? FIND.order.findIndex((x) => x.page >= S.cur) : (() => { let r = -1; FIND.order.forEach((x, k) => { if (x.page <= S.cur) r = k; }); return r; })();
+    if (i < 0) i = dir > 0 ? 0 : FIND.order.length - 1;
+  } else i = (i + dir + FIND.order.length) % FIND.order.length;
+  showHit(FIND.order[i]);
+}
+function openFind() {
+  if (!S.pdf) return;
+  FIND.open = true; $('#findbar').hidden = false;
+  const inp = $('#findInput');
+  const sel = String(window.getSelection ? window.getSelection() : '').trim();
+  if (sel && sel.length < 100 && !sel.includes('\n')) inp.value = sel;          // 選択している文字があれば、それを探す
+  inp.focus(); inp.select();
+  if (inp.value !== FIND.q) { FIND.q = inp.value; runFind(); } else for (const p of S.pages) drawHits(p);
+}
+function closeFind() {
+  if (!FIND.open) return;
+  FIND.open = false; FIND.gen++; $('#findbar').hidden = true;
+  for (const p of S.pages) { const o = p.el.querySelector(':scope > svg.hl'); if (o) o.remove(); }
+}
+// 文書が変わった（編集・ページ操作など）: 読み取った文字を捨てて、開いていれば探し直す
+function findReset() {
+  FIND.cache.clear(); findDet.clear(); FIND.gen++;
+  if (FIND.open && FIND.q) runFind(); else { FIND.byPage = new Map(); FIND.order = []; FIND.cur = null; }
+}
+$('#findInput').addEventListener('input', (e) => {
+  clearTimeout(FIND.timer);
+  FIND.timer = setTimeout(() => { if (e.target.value !== FIND.q) { FIND.q = e.target.value; runFind(); } }, 250);
+});
+$('#findInput').addEventListener('keydown', (e) => {
+  if (e.key === 'Enter') {
+    e.preventDefault(); clearTimeout(FIND.timer);
+    if (e.target.value !== FIND.q) { FIND.q = e.target.value; runFind(); } else findStep(e.shiftKey ? -1 : 1);
+  } else if (e.key === 'Escape') { e.preventDefault(); closeFind(); wrap.focus && wrap.focus(); }
+});
+$('#findNext').addEventListener('click', () => findStep(1));
+$('#findPrev').addEventListener('click', () => findStep(-1));
+$('#findClose').addEventListener('click', closeFind);
+$('#btnFind').addEventListener('click', () => (FIND.open ? closeFind() : openFind()));
 /* ------------------------------------------------------- コメント一覧 */
 let listRaf = 0;
 function scheduleList() { if (listRaf) return; listRaf = requestAnimationFrame(() => { listRaf = 0; renderList(); }); }
@@ -4642,7 +5085,7 @@ async function applyItems(items, msg = 'ページを処理中…') {
   if (S.busy) return false;
   const sn = takeSnap(); setBusy(true, msg);
   try {
-    const doc = await PDFDocument.load(S.baseBytes, { updateMetadata: false });
+    const doc = await PDFDocument.load(await baseAll(), { updateMetadata: false });
     const old = doc.getPages(), extDocs = new Map(), newPages = [], map = new Map();
     for (const it of items) {
       let page;
@@ -4658,8 +5101,16 @@ async function applyItems(items, msg = 'ページを処理中…') {
     for (let k = old.length - 1; k >= 0; k--) doc.removePage(k);
     for (const pg of newPages) doc.addPage(pg);
     if (map.size < old.length) gcDoc(doc);
-    const bytes = await doc.save({ useObjectStreams: false });
+    let bytes = await doc.save({ useObjectStreams: false });
     S.annots = S.annots.filter((a) => map.has(a.page - 1)).map((a) => ({ ...a, page: map.get(a.page - 1) + 1 }));
+    // v4.11.1: 貼り付け・挿入したページに、このアドオンで書いた注釈があれば、既存の注釈にせず、編集できる注釈として取り込む
+    if (items.some((it) => it.k !== 'old') && bytesContain(bytes, 'EPAType', MARKER)) {
+      try {
+        const r = await extractOurs(bytes), ids = new Set(S.annots.map((a) => a.id));
+        for (const a of r.annots) { if (ids.has(a.id)) a.id = newId(); ids.add(a.id); }
+        bytes = r.bytes; S.annots.push(...r.annots);
+      } catch (e) { console.warn('貼り付けたページの注釈の取り込みに失敗', e); }
+    }
     pruneSel();
     await setBase(bytes, { keepScroll: false });
     commit(sn); goPage(Math.min(S.cur, S.pages.length));
@@ -5052,7 +5503,7 @@ async function openDocProps() {
   const meta = await pdf.getMetadata().catch(() => ({ info: {} }));
   const info = meta.info || {};
   const perms = await pdf.getPermissions().catch(() => null);
-  const enc = await UNLOCK.info(S.baseBytes);
+  const enc = await lockInfo();
   const locked = !!S.libErr || !!(enc && !enc.error);
   const page = await pdf.getPage(S.cur), v = page.getViewport({ scale: 1, rotation: 0 }), r = page.rotate;
   const mm = (pt) => (pt * 25.4 / 72).toFixed(1);
@@ -5099,7 +5550,7 @@ async function openDocProps() {
       btn.addEventListener('click', async () => {
         btn.disabled = true; msg.textContent = '確認しています…'; msg.classList.remove('derr-ok');
         try {
-          const r2 = await UNLOCK.unlock(S.baseBytes, pw.value);
+          const r2 = await UNLOCK.unlock(await baseAll(), pw.value);
           if (r2.error === 'password') { msg.textContent = 'パスワードが違います。所有者パスワード（権限パスワード）を入力してください。'; btn.disabled = false; pw.select(); return; }
           d.close();
           await applyUnlocked(r2.bytes);
@@ -5115,7 +5566,7 @@ async function openDocProps() {
   if (res.title === (info.Title || '') && res.author === (info.Author || '') && res.subject === (info.Subject || '') && res.keywords === (info.Keywords || '')) return;
   const sn = takeSnap(); setBusy(true, '文書プロパティを変更中…');
   try {
-    const doc = await PDFDocument.load(S.baseBytes, { updateMetadata: false });
+    const doc = await PDFDocument.load(await baseAll(), { updateMetadata: false });
     doc.setTitle(res.title); doc.setAuthor(res.author); doc.setSubject(res.subject);
     doc.setKeywords(res.keywords.split(/\s*[,、，;；]\s*/).filter(Boolean));
     doc.setModificationDate(new Date());
@@ -5212,7 +5663,7 @@ const pnum = (v) => { const r = Math.round(v * 10000) / 10000; return Object.is(
 // 印刷のもとにするPDF（追加した注釈を含む・暗号化を外したもの）
 async function printSourceBytes() {
   if (encLocked()) {      // 暗号化されたPDF: 印刷用のコピーだけ暗号化を外し、追加した注釈を書き込む
-    const r = await UNLOCK.unlock(S.baseBytes, '', { asUser: true });
+    const r = await UNLOCK.unlock(await baseAll(), '', { asUser: true });
     if (r.bytes) return S.annots.length ? await buildViaPdfLib(r.bytes) : r.bytes;
   }
   return await buildPdfBytes();
@@ -5527,7 +5978,7 @@ async function embedAnnots() {
   const targets = res === 'cur' ? new Set([cur]) : new Set(S.pages.map((p) => p.num));
   const sn = takeSnap(); setBusy(true, '注釈を埋め込み中…');
   try {
-    const doc = await PDFDocument.load(S.baseBytes, { updateMetadata: false });
+    const doc = await PDFDocument.load(await baseAll(), { updateMetadata: false });
     await writeAnnots(doc, S.annots.filter((a) => targets.has(a.page)));
     let count = 0;
     doc.getPages().forEach((page, i) => {

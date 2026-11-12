@@ -2,7 +2,7 @@
   "manifest_version": 3,
   "name": "ローカルPDFエディター（文字・図形・注釈・ページ編集）",
   "short_name": "PDFエディター",
-  "version": "4.11.1",
+  "version": "4.11.2",
   "description": "PCのPDFをブラウザーでそのまま編集。PDF内の文字の書き換え、図形の移動・拡大縮小・色変更、注釈やスタンプの追加、ページの整理、印刷ができます。",
   "permissions": [
     "webNavigation",

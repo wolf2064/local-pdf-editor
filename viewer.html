@@ -54,6 +54,7 @@
   <div class="grp">
     <input id="pageNum" type="number" min="1" value="1" aria-label="ページ番号"> / <span id="pageCount">–</span>
   </div>
+  <button id="btnFind" type="button" title="文字を検索 (Ctrl+F)"><svg viewBox="0 0 24 24" class="ico"><circle cx="10.5" cy="10.5" r="6" stroke="currentColor" stroke-width="2" fill="none"/><path d="M15 15l5.5 5.5" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"/></svg><span class="lbl"> 検索</span></button>
   <span id="fileName" class="fname"></span>
   <button id="btnComments" type="button" title="コメント一覧を表示">コメント一覧</button>
   <button id="btnProps" type="button" title="右パネルの表示/非表示">パネル</button>
@@ -107,6 +108,13 @@
   </aside>
 
   <div id="wrapbox">
+    <div id="findbar" hidden role="search">
+      <input id="findInput" type="search" placeholder="PDF内の文字を検索" aria-label="検索する文字" autocomplete="off">
+      <span id="findInfo" class="small"></span>
+      <button id="findPrev" type="button" title="前を検索 (Shift+Enter / Shift+F3)">▲</button>
+      <button id="findNext" type="button" title="次を検索 (Enter / F3)">▼</button>
+      <button id="findClose" type="button" title="閉じる (Esc)">✕</button>
+    </div>
     <div id="wrap"><div id="pages"></div>
       <div id="msg" class="msg"><p>PDFを開いてください。</p><button id="btnOpen2" type="button">PDFファイルを開く</button><p class="small">ここにPDFをドラッグ＆ドロップしても開けます。</p></div>
     </div>
@@ -211,6 +219,7 @@
           <li>PCに保存したPDFを開くと、自動でこのエディターで開きます（インターネット上のPDFは扱いません）。ツールバーのアイコンからも開けます</li>
           <li>保存: ダイアログなしで保存します。保存先が分かっていれば上書き、無ければダウンロードフォルダ（同名は上書き）。別の場所へは「名前を付けて保存」</li>
           <li>雲形(C): クリックで頂点を追加、ダブルクリック/Enter/Escで閉じて確定、Backspaceで1点戻る。ドラッグすると四角形の雲になります。選択すると頂点をドラッグして形を変えられます（ダブルクリックで頂点追加／Alt+クリックで削除）</li>
+          <li>検索 (Ctrl+F): 上のバーの「検索」。表示中のページから順に探し、見つかった箇所に色を付けます。Enter / F3 で次へ、Shift+Enter / Shift+F3 で前へ、Esc で閉じます。大文字と小文字・全角と半角は区別せず、空白や改行は無視します（スキャンした画像の文字は探せません）</li>
           <li>しおり: 右のパネルの「しおり」タブ。クリックでその位置へ移動。「＋ しおりを追加」(Ctrl+B) で、今見えている位置にしおりを付けます。名前の変更（ダブルクリック・F2）・削除もできます</li>
           <li>ページの整理: 左サイドバーの「ページの整理」。サムネイルをダブルクリックすると、変更を反映してそのページを開きます。「コピー」「貼り付け」で、同じブラウザのほかのタブで開いているPDFとの間でもページをコピーできます。「空白ページ」で、選択したページと同じ大きさの白紙を挿入します</li>
           <li>丸・楕円(E): ドラッグで楕円、Shiftを押しながらで正円。選択すると四角のハンドルで大きさを変えられます</li>

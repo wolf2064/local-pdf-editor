@@ -61,6 +61,7 @@ body.paged .pg{margin:0 auto}
 /* 1ページ表示: 表示していないページは、画面の外に置いたまま描画を済ませておく（先読み）。切り替え時に白い画面が出ない */
 .pg.off{position:absolute;left:-200000px;top:0;margin:0!important;visibility:hidden;pointer-events:none}
 .pg canvas{position:absolute;inset:0;display:block}
+.pg canvas.pv{width:100%;height:100%}                    /* 前後のページの縮小版（v4.11.2） */
 /* まだ描いていないページ（v4.11.1） */
 .pg:not(:has(> canvas))::before{content:'レンダリング中…';position:absolute;left:0;right:0;top:50%;transform:translateY(-50%);text-align:center;color:#8a8f98;font-size:13px;pointer-events:none}
 body.gam .pg canvas{filter:url(#epaGamma)}
@@ -300,3 +301,15 @@ button.locked,.tool.locked{opacity:.4;cursor:not-allowed}
 #bmTree .tt{flex:1;min-width:0;word-break:break-all}
 #bmTree .pn{flex:0 0 auto;color:#888;font-size:11px;padding-left:6px}
 #bmTree li.closed>ul{display:none}
+
+/* 検索（v4.11.2） */
+#findbar{position:absolute;top:8px;right:22px;z-index:30;display:flex;align-items:center;gap:6px;padding:6px 8px;background:#fff;border:1px solid var(--bd);border-radius:6px;box-shadow:0 2px 10px rgba(0,0,0,.25)}
+#findbar[hidden]{display:none}
+#findInput{width:220px;height:28px;padding:0 8px;border:1px solid var(--bd);border-radius:4px}
+#findInput.none{background:#fde8e8}
+#findInfo{min-width:70px;color:#555;white-space:nowrap}
+#findbar button{height:28px;min-width:30px;border:1px solid var(--bd);border-radius:4px;background:#fff;cursor:pointer}
+#findbar button:hover{background:#e8f1fb}
+.pg svg.hl{position:absolute;inset:0;width:100%;height:100%;pointer-events:none;mix-blend-mode:multiply;z-index:1}
+.pg svg.hl polygon{fill:rgba(255,214,0,.55)}
+.pg svg.hl polygon.cur{fill:rgba(255,128,0,.75)}
